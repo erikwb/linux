@@ -483,3 +483,23 @@
 		};
 	};
 };
+
+/*
+ * Relative CPU capacity. Without it every core reports 1024 and the scheduler
+ * puts latency-sensitive work (Hyprland frame composition) on E cores.
+ * Omarchy-M4-Native measured an E core at 0.324 of a P core at the iBoot
+ * handoff clocks (E 900 MHz, P 1800 MHz). This kernel has no cpufreq or CPU
+ * clocks for T8132, so arch_topology does not scale by frequency and these
+ * values are the effective capacities. Once cpufreq binds, E should become
+ * 663 (0.324 * 1024 * 1800 / 900) so the frequency scaling is not doubled.
+ */
+&cpu_e0 { capacity-dmips-mhz = <331>; };
+&cpu_e1 { capacity-dmips-mhz = <331>; };
+&cpu_e2 { capacity-dmips-mhz = <331>; };
+&cpu_e3 { capacity-dmips-mhz = <331>; };
+&cpu_e4 { capacity-dmips-mhz = <331>; };
+&cpu_e5 { capacity-dmips-mhz = <331>; };
+&cpu_p0 { capacity-dmips-mhz = <1024>; };
+&cpu_p1 { capacity-dmips-mhz = <1024>; };
+&cpu_p2 { capacity-dmips-mhz = <1024>; };
+&cpu_p3 { capacity-dmips-mhz = <1024>; };
