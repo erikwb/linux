@@ -298,6 +298,13 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
     }
 
+    /// Selects the early crashlog buffer exchange used by the G16 GPU.
+    /// Call before starting the coprocessor CPU.
+    pub fn set_early_crashlog(self: Pin<&mut Self>) {
+        // SAFETY: `rtk` is valid per the type invariant.
+        unsafe { bindings::apple_rtkit_set_early_crashlog(self.rtk) };
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.

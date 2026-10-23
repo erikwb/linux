@@ -203,6 +203,14 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		ep = 32 * base + i;
 		dev_dbg(rtk->dev, "RTKit: Discovered endpoint 0x%02x\n", ep);
 		set_bit(ep, rtk->endpoints);
+		if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG) {
+			ret = apple_rtkit_start_ep(rtk, ep);
+			if (ret) {
+				rtk->boot_result = ret;
+				complete_all(&rtk->epmap_completion);
+				return;
+			}
+		}
 	}
 
 	/*
@@ -245,7 +253,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_TRACEKIT:
 			/* already started while handling the map */
 			if (ep == APPLE_RTKIT_EP_CRASHLOG &&
-			    apple_rtkit_coproc_places_buffers(rtk))
+			    (apple_rtkit_coproc_places_buffers(rtk) || rtk->early_crashlog))
 				break;
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
@@ -405,7 +413,8 @@ reply:
 					    buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
-	} else if (apple_rtkit_coproc_places_buffers(rtk)) {
+	} else if (apple_rtkit_coproc_places_buffers(rtk) ||
+		   (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)) {
 		/* acknowledge the co-processor's own buffer with its request */
 		apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
@@ -564,6 +573,8 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		if (apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						     APPLE_RTKIT_EP_CRASHLOG, msg))
 			goto unmapped;
+		if (rtk->early_crashlog)
+			complete_all(&rtk->crashlog_completion);
 		/*
 		 * In a session that went through the handshake, the first
 		 * message on this endpoint is the buffer request. Firmware may
@@ -1134,6 +1145,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	INIT_WORK(&rtk->sync_ack_work, apple_rtkit_sync_ack_work);
 
 	init_completion(&rtk->epmap_completion);
+	init_completion(&rtk->crashlog_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
 	init_completion(&rtk->ap_pwr_ack_completion);
 
@@ -1275,6 +1287,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	reinit_completion(&rtk->epmap_completion);
+	reinit_completion(&rtk->crashlog_completion);
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
@@ -1379,9 +1392,25 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 		return ret;
 	}
 
+	if (rtk->early_crashlog) {
+		ret = apple_rtkit_wait(rtk, &rtk->crashlog_completion);
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: crashlog buffer setup failed: %d\n", ret);
+			return ret;
+		}
+	}
+
 	return early_ap_power ? 0 :
 		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 }
+
+/* Call before starting the co-processor: the G16 GPU firmware places its crashlog buffer early. */
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk)
+{
+	rtk->early_crashlog = true;
+	reinit_completion(&rtk->crashlog_completion);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_early_crashlog);
 
 int apple_rtkit_boot(struct apple_rtkit *rtk)
 {

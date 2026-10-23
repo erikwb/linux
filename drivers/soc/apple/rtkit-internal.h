@@ -42,6 +42,9 @@ struct apple_rtkit {
 	struct apple_mbox *mbox;
 
 	struct completion epmap_completion;
+	/* G16 GPU: crashlog endpoint started with the endpoint map; boot waits for its buffer. */
+	bool early_crashlog;
+	struct completion crashlog_completion;
 	struct completion iop_pwr_ack_completion;
 	struct completion ap_pwr_ack_completion;
 

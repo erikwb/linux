@@ -22,6 +22,14 @@ pub trait DriverFile {
 
     /// Get raw drm_file pointer
     fn as_raw(&self) -> *mut bindings::drm_file;
+
+    /// Called once after the driver data is associated with the DRM file,
+    /// before the file is available to userspace.
+    fn post_open(&self, _file: &File<Self>)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 /// An open DRM File.
@@ -44,7 +52,8 @@ impl<T: DriverFile> File<T> {
         unsafe { &*ptr.cast() }
     }
 
-    pub(super) fn as_raw(&self) -> *mut bindings::drm_file {
+    /// Return the DRM core pointer, valid for this open file's lifetime.
+    pub fn as_raw(&self) -> *mut bindings::drm_file {
         self.0.get()
     }
 
@@ -95,6 +104,8 @@ impl<T: DriverFile> File<T> {
 
         // SAFETY: By the type invariants of `Self`, `self.as_raw()` is always valid.
         unsafe { (*file.as_raw()).driver_priv = driver_priv.cast() };
+
+        file.inner().post_open(file);
 
         0
     }

@@ -12,6 +12,7 @@
 #include "t8132.dtsi"
 #include "t8132-jxxx.dtsi"
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/gpio/gpio.h>
 
 / {
 	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
@@ -32,4 +33,453 @@
 
 &fpwm1 {
 	status = "okay";
+};
+
+/*
+ * J713 (M4 MacBook Air) bring-up additions.
+ *
+ * Internal storage: the post-M4 ANS (Aurora's apple,t8132-nvme-ans2 driver
+ * adopts the live session m1n1 hands over). Addresses and interrupts from the
+ * live ADT as used by Omarchy-M4-Native's J713 device tree; power domains as
+ * Aurora's T8140 node (apcie_phy keeps the ANS PCIe link out of L1 idle).
+ */
+&soc {
+	ans_mbox: mbox@481608000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x81608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1003 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1004 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1005 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1006 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_ans>;
+	};
+
+	sart: sart@485c50000 {
+		compatible = "apple,t8132-sart", "apple,t6000-sart";
+		reg = <0x4 0x85c50000 0x0 0xc000>;
+		power-domains = <&ps_ans>;
+	};
+
+	nvme: nvme@4c5cc0000 {
+		compatible = "apple,t8132-nvme-ans2";
+		/*
+		 * The ADT sizes the controller window at 0x10000, but the linear
+		 * submission queue registers at +0x24908..+0x24910 sit in the same
+		 * non-secure alias (as on T8140).
+		 */
+		reg = <0x4 0xc5cc0000 0x0 0x30000>,
+		      <0x4 0x81600000 0x0 0x4000>,
+		      <0x4 0x85cc0000 0x0 0x60000>;
+		reg-names = "nvme", "ans", "nvmmu";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1018 IRQ_TYPE_LEVEL_HIGH>;
+		mboxes = <&ans_mbox>;
+		apple,sart = <&sart>;
+		power-domains = <&ps_ans>, <&ps_apcie_sys_st>, <&ps_apcie_phy_sw>;
+		power-domain-names = "ans", "apcie0", "apcie_phy";
+		resets = <&ps_ans>;
+	};
+};
+
+/*
+ * atc2/atc3 power domains cannot power on on J713 and wedge the boot once
+ * their subtree registers (Omarchy-M4-Native hardware night 1, patch 0011).
+ * Consumers first so no remaining node references a deleted one.
+ */
+/delete-node/ &ps_atc2_usb;
+/delete-node/ &ps_atc3_usb;
+/delete-node/ &ps_atc2_cio_usb;
+/delete-node/ &ps_atc2_cio_pcie;
+/delete-node/ &ps_atc2_cio;
+/delete-node/ &ps_atc2_pcie;
+/delete-node/ &ps_atc2_usb_aon;
+/delete-node/ &ps_atc2_common;
+/delete-node/ &ps_atc3_cio_usb;
+/delete-node/ &ps_atc3_cio_pcie;
+/delete-node/ &ps_atc3_cio;
+/delete-node/ &ps_atc3_pcie;
+/delete-node/ &ps_atc3_usb_aon;
+/delete-node/ &ps_atc3_common;
+
+/*
+ * J713 system management and internal input (keyboard/trackpad).
+ * Addresses, interrupts, PMIC NVMEM cells and SMC GPIO pins from the live
+ * ADT as used by Omarchy-M4-Native's J713 device tree; node layout and
+ * properties follow Aurora's T8140/J700 bindings.
+ */
+&soc {
+	nub_spmi0: spmi@388714000 {
+		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x88714000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		pmic@e {
+			compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+			reg = <0xe 0>;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				boot_stage: boot-stage@f801 {
+					reg = <0xf801 0x1>;
+				};
+
+				boot_error_count: boot-error-count@f802,0 {
+					reg = <0xf802 0x1>;
+					bits = <0 4>;
+				};
+
+				panic_count: panic-count@f802,4 {
+					reg = <0xf802 0x1>;
+					bits = <4 4>;
+				};
+
+				shutdown_flag: shutdown-flag@f80f,3 {
+					reg = <0xf80f 0x1>;
+					bits = <3 1>;
+				};
+
+				rtc_offset: rtc-offset@2100 {
+					reg = <0x2100 0x6>;
+				};
+			};
+		};
+	};
+
+	smc: smc@38c600000 {
+		compatible = "apple,t8132-smc", "apple,t8103-smc";
+		reg = <0x3 0x8c600000 0x0 0x4000>,
+		      <0x3 0x8de00000 0x0 0x100000>;
+		reg-names = "smc", "sram";
+		mboxes = <&smc_mbox>;
+
+		smc_gpio: gpio {
+			compatible = "apple,smc-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		smc_hwmon: hwmon {
+			compatible = "apple,smc-hwmon";
+
+			power-PHPC {
+				apple,key-id = "PHPC";
+				label = "Heatpipe Power";
+			};
+
+			temperature-TB0T {
+				apple,key-id = "TB0T";
+				label = "Battery Hotspot";
+			};
+
+			temperature-TCHP {
+				apple,key-id = "TCHP";
+				label = "Charge Regulator Temp";
+			};
+
+			temperature-TW0P {
+				apple,key-id = "TW0P";
+				label = "WiFi/BT Module Temp";
+			};
+
+			voltage-SBAV {
+				apple,key-id = "SBAV";
+				label = "Battery Voltage";
+			};
+
+			voltage-VD0R {
+				apple,key-id = "VD0R";
+				label = "Charger Input Voltage";
+			};
+		};
+
+		smc_reboot: reboot {
+			compatible = "apple,smc-reboot";
+			nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+				      <&boot_error_count>, <&panic_count>;
+			nvmem-cell-names = "shutdown_flag", "boot_stage",
+					   "boot_error_count", "panic_count";
+		};
+
+		smc_rtc: rtc {
+			compatible = "apple,smc-rtc";
+			nvmem-cells = <&rtc_offset>;
+			nvmem-cell-names = "rtc_offset";
+		};
+	};
+
+	smc_mbox: mailbox@38c608000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x8c608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 562 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 561 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 563 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 564 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	mtp: mtp@394600000 {
+		compatible = "apple,t8132-mtp", "apple,t8132-rtk-helper-asc4",
+			     "apple,mtp", "apple,rtk-helper-asc4";
+		reg = <0x3 0x94600000 0x0 0x4000>,
+		      <0x3 0x94050000 0x0 0x4000>;
+		reg-names = "asc", "sram";
+		mboxes = <&mtp_mbox>;
+		iommus = <&mtp_dart 0>;
+		#helper-cells = <0>;
+	};
+
+	mtp_mbox: mailbox@394608000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x94608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1114 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1113 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1115 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1116 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	mtp_dart: iommu@394800000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		/* The ADT (dart-mtp reg[0]) sizes this window at 0xc000, as on T8140. */
+		reg = <0x3 0x94800000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1091 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+	};
+
+	mtp_dockchannel: fifo@394b14000 {
+		compatible = "apple,t8132-dockchannel", "apple,dockchannel";
+		reg = <0x3 0x94b14000 0x0 0x1000>;
+		reg-names = "irq";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1093 IRQ_TYPE_LEVEL_HIGH>;
+
+		ranges = <0x0000 0x3 0x94b28000 0x1000>,
+			 <0x4000 0x3 0x94b2c000 0x1000>,
+			 <0x8000 0x3 0x94b30000 0x1000>,
+			 <0xc000 0x3 0x94b34000 0x1000>;
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		mtp_hid: input@8000 {
+			compatible = "apple,dockchannel-hid";
+			reg = <0x8000 0x1000>,
+			      <0xc000 0x1000>,
+			      <0x0000 0x1000>,
+			      <0x4000 0x1000>;
+			reg-names = "config", "data",
+				    "rmt-config", "rmt-data";
+			iommus = <&mtp_dart 0>;
+			interrupt-parent = <&mtp_dockchannel>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+				     <3 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tx", "rx";
+			apple,fifo-size = <0x800>;
+			apple,helper-cpu = <&mtp>;
+			/*
+			 * SMC gP1c: the J713 AFE reset is a board-function action
+			 * (gpio-macsmc J713 case); level 1 asserts the reset.
+			 */
+			apple,afe-reset-gpios = <&smc_gpio 0x1c 0>;
+
+			multi-touch {
+				firmware-name = "apple/tpmtfw-j713.bin";
+				/* Version-2 interface power requests, as J713 needs. */
+				apple,power-method = <2>;
+			};
+
+			keyboard {
+				hid-country-code = <0>;
+				apple,keyboard-layout-id = <0>;
+			};
+
+			stm {
+			};
+		};
+	};
+};
+
+/*
+ * J713 GPU (T8132 G16), from Omarchy-M4-Native's portable device tree.
+ * m1n1 fills the reserved memory and GPU properties and enables the GPU
+ * when its handoff succeeds (kboot_gpu.c, dt_set_gpu_t8132).
+ */
+/ {
+	aliases {
+		gpu = &gpu;
+	};
+
+	reserved-memory {
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_l2: uat-l2 {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		gpu_fw: gpu-firmware {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+	};
+};
+
+&soc {
+	gpu_mbox: mailbox@302608000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x02608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 994 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 995 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_gfx>;
+	};
+
+	gpu: gpu@302600000 {
+		compatible = "apple,agx-t8132";
+		reg = <0x3 0x02600000 0x0 0x88000>,
+		      <0x3 0x00000000 0x0 0x4000000>;
+		reg-names = "asc", "sgx";
+		mboxes = <&gpu_mbox>;
+		power-domains = <&ps_gfx>;
+		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_l2>,
+				<&uat_handoff>, <&gpu_fw>;
+		memory-region-names = "ttbs", "pagetables", "l2", "handoff",
+				      "firmware";
+		/* Enabled by m1n1 once the firmware memory handoff is ready. */
+		status = "disabled";
+	};
+};
+
+/*
+ * J713 internal PCIe: port 0 carries the BCM4388 C2 ("garden") Wi-Fi and
+ * Bluetooth functions. From Omarchy-M4-Native's portable device tree; m1n1
+ * fills the MAC addresses, antenna SKU and calibration through the aliases.
+ */
+/ {
+	aliases {
+		bluetooth0 = &bluetooth0;
+		wifi0 = &wifi0;
+	};
+};
+
+&pinctrl_ap {
+	pcie_pins: pcie-pins {
+		pinmux = <0x200a0>;
+	};
+};
+
+&soc {
+	pcie0_dart: iommu@490000000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		/* The ADT (dart-apcie0 reg[0]) sizes this window at 0x20000. */
+		reg = <0x4 0x90000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1232 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_apcie_phy_sw>;
+	};
+
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t8132-pcie", "apple,t6020-pcie";
+		device_type = "pci";
+		reg = <0x1c 0xb0000000 0x0 0x10000000>,
+		      <0x4 0x94000000 0x0 0x4000>,
+		      <0x4 0x90028000 0x0 0x8000>,
+		      <0x4 0x91028000 0x0 0x8000>,
+		      <0x4 0x92028000 0x0 0x8000>,
+		      <0x4 0x97020000 0x0 0x4000>,
+		      <0x4 0x97024000 0x0 0x4000>,
+		      <0x4 0x97028000 0x0 0x4000>;
+		reg-names = "config", "rc", "port0", "port1", "port2",
+			    "phy0", "phy1", "phy2";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1231 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1240 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1249 IRQ_TYPE_LEVEL_HIGH>;
+		msi-controller;
+		msi-parent = <&pcie0>;
+		msi-ranges = <&aic AIC_IRQ 1506 IRQ_TYPE_EDGE_RISING 96>;
+		iommu-map = <0x100 &pcie0_dart 1 1>,
+			    <0x101 &pcie0_dart 2 1>;
+		iommu-map-mask = <0xffff>;
+		bus-range = <0 8>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+			 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
+		power-domains = <&ps_apcie_phy_sw>;
+		pinctrl-0 = <&pcie_pins>;
+		pinctrl-names = "default";
+
+		pcie0_port0: pci@0,0 {
+			device_type = "pci";
+			reg = <0x0 0x0 0x0 0x0 0x0>;
+			bus-range = <1 1>;
+			pwren-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
+			reset-gpios = <&pinctrl_ap 163 GPIO_ACTIVE_LOW>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &pcie0_port0 0 0 0 0>,
+					<0 0 0 2 &pcie0_port0 0 0 0 1>,
+					<0 0 0 3 &pcie0_port0 0 0 0 2>,
+					<0 0 0 4 &pcie0_port0 0 0 0 3>;
+
+			wifi0: wifi@0,0 {
+				compatible = "pci14e4,4434";
+				reg = <0x10000 0x0 0x0 0x0 0x0>;
+				/* To be filled by the loader */
+				local-mac-address = [00 00 00 00 00 00];
+				apple,antenna-sku = "XX";
+				brcm,board-type = "apple,garden";
+			};
+
+			bluetooth0: bluetooth@0,1 {
+				compatible = "pci14e4,5f72";
+				reg = <0x10100 0x0 0x0 0x0 0x0>;
+				/* To be filled by the loader */
+				local-bd-address = [00 00 00 00 00 00];
+				brcm,board-type = "apple,garden";
+			};
+		};
+	};
 };

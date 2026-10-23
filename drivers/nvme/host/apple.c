@@ -2627,6 +2627,11 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
 	.max_queue_depth = 64,
+	/*
+	 * J713: writes reported complete were lost across an abrupt reset,
+	 * as on T8140. Follow each FUA write with an explicit flush.
+	 */
+	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
 
 static const struct apple_nvme_hw apple_nvme_t8140_hw = {

@@ -261,6 +261,8 @@ struct aic_info {
 	bool fast_ipi;
 	bool local_fast_ipi;
 	bool vm_timer_fiq_readonly;
+	/* T8132: ICH_HCR_EL2 accesses kill the core during early CPU init. */
+	bool ich_hcr_locked;
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -315,7 +317,20 @@ static const struct aic_info aic3_t8142_info __initconst = {
 	.vm_timer_fiq_readonly = true,
 };
 
+static const struct aic_info aic3_t8132_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.vm_timer_fiq_readonly = true,
+	.ich_hcr_locked = true,
+};
+
 static const struct of_device_id aic_info_match[] = {
+	{
+		.compatible = "apple,t8132-aic3",
+		.data = &aic3_t8132_info,
+	},
 	{
 		.compatible = "apple,t8142-aic3",
 		.data = &aic3_t8142_info,
@@ -438,7 +453,7 @@ static void __exception_irq_entry aic_handle_irq(struct pt_regs *regs)
 	 * for them separately. It should however only trigger when NV is
 	 * in use, and be cleared when coming back from the handler.
 	 */
-	if (is_kernel_in_hyp_mode() &&
+	if (is_kernel_in_hyp_mode() && !aic_irqc->info.ich_hcr_locked &&
 	    (read_sysreg_s(SYS_ICH_HCR_EL2) & ICH_HCR_EL2_En) &&
 	    read_sysreg_s(SYS_ICH_MISR_EL2) != 0) {
 		u64 val;
@@ -920,7 +935,8 @@ static int aic_init_cpu(unsigned int cpu)
 		aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_V | VM_TMR_FIQ_ENABLE_P, true);
 
 		/* vGIC maintenance IRQ */
-		sysreg_clear_set_s(SYS_ICH_HCR_EL2, ICH_HCR_EL2_En, 0);
+		if (!aic_irqc->info.ich_hcr_locked)
+			sysreg_clear_set_s(SYS_ICH_HCR_EL2, ICH_HCR_EL2_En, 0);
 	}
 
 	/* PMC FIQ */

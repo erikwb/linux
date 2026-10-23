@@ -34,6 +34,14 @@
 #define MACSMC_J700_RADIO_REG_ON_HI	0x80000
 
 /*
+ * J713 (M4 MacBook Air) AFE reset: gP1c takes a board-function action, not
+ * a CMD_OUTPUT level (Omarchy-M4-Native's J713 AFE action): 0x00010000 | arg,
+ * where arg 1 asserts the reset. It cannot be read back.
+ */
+#define MACSMC_J713_AFE_RESET_GPIO	0x1c
+#define MACSMC_J713_AFE_ACTION		0x00010000
+
+/*
  * Commands 0-6 are, presumably, the intended API.
  * Command 0xff lets you get/set the pin configuration in detail directly,
  * but the bit meanings seem not to be stable between devices/PMU hardware
@@ -95,6 +103,7 @@ struct macsmc_gpio {
 	smc_key base_key;
 
 	bool j700_pcio;
+	bool j713_afe;
 	DECLARE_BITMAP(j700_pcio_level, MAX_GPIO);
 };
 
@@ -104,6 +113,12 @@ static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
 	return smcgp->j700_pcio &&
 	       (offset == MACSMC_J700_AFE_RESET_GPIO ||
 		offset == MACSMC_J700_RADIO_REG_ON_GPIO);
+}
+
+static bool macsmc_gpio_is_j713_afe(struct macsmc_gpio *smcgp,
+				    unsigned int offset)
+{
+	return smcgp->j713_afe && offset == MACSMC_J713_AFE_RESET_GPIO;
 }
 
 static int macsmc_gpio_nr(smc_key key)
@@ -176,7 +191,8 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	u32 val;
 	int ret;
 
-	if (macsmc_gpio_is_j700_pcio(smcgp, offset))
+	if (macsmc_gpio_is_j700_pcio(smcgp, offset) ||
+	    macsmc_gpio_is_j713_afe(smcgp, offset))
 		return GPIO_LINE_DIRECTION_OUT;
 
 	/* First try reading the explicit pin mode register */
@@ -200,7 +216,8 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	int ret;
 
 	/* pcIO cannot be read back; report the last level written. */
-	if (macsmc_gpio_is_j700_pcio(smcgp, offset))
+	if (macsmc_gpio_is_j700_pcio(smcgp, offset) ||
+	    macsmc_gpio_is_j713_afe(smcgp, offset))
 		return test_bit(offset, smcgp->j700_pcio_level);
 
 	ret = macsmc_gpio_get_direction(gc, offset);
@@ -243,6 +260,18 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 			dev_err_ratelimited(smcgp->dev,
 					    "pcIO GPIO %u set to %u failed: %d\n",
 					    offset, !!value, ret);
+			return ret;
+		}
+		assign_bit(offset, smcgp->j700_pcio_level, value);
+		return 0;
+	}
+
+	if (macsmc_gpio_is_j713_afe(smcgp, offset)) {
+		ret = apple_smc_write_u32(smcgp->smc, key,
+					  MACSMC_J713_AFE_ACTION | (value ? 1 : 0));
+		if (ret < 0) {
+			dev_err_ratelimited(smcgp->dev, "%p4ch AFE action %u failed: %d\n",
+					    &key, !!value, ret);
 			return ret;
 		}
 		assign_bit(offset, smcgp->j700_pcio_level, value);
@@ -317,6 +346,8 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
+	smcgp->j713_afe = of_machine_is_compatible("apple,j713") &&
+			  device_is_compatible(&pdev->dev, "apple,smc-gpio");
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
 	if (smcgp->first_index < 0)

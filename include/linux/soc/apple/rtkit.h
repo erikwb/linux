@@ -162,6 +162,12 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk);
 int apple_rtkit_boot(struct apple_rtkit *rtk);
 
 /*
+ * Start the crashlog endpoint with the endpoint map and wait for its buffer
+ * before AP power-on (G16 GPU). Call before the co-processor starts.
+ */
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk);
+
+/*
  * Mark an instance created with apple_rtkit_init() as running without a
  * handshake, see apple_rtkit_init_adopted().
  */
