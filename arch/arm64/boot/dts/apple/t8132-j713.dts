@@ -485,21 +485,123 @@
 };
 
 /*
- * Relative CPU capacity. Without it every core reports 1024 and the scheduler
- * puts latency-sensitive work (Hyprland frame composition) on E cores.
- * Omarchy-M4-Native measured an E core at 0.324 of a P core at the iBoot
- * handoff clocks (E 900 MHz, P 1800 MHz). This kernel has no cpufreq or CPU
- * clocks for T8132, so arch_topology does not scale by frequency and these
- * values are the effective capacities. Once cpufreq binds, E should become
- * 663 (0.324 * 1024 * 1800 / 900) so the frequency scaling is not doubled.
+ * CPU frequency scaling, from Omarchy-M4-Native's j713-cpufreq.dtso (KB2UKA).
+ * Cluster performance controllers at the ADT pmgr reg[5] (E) and reg[16] (P)
+ * bases; DVFS_STATUS reads back in the T8112 layout. Frequencies come from
+ * the ADT voltage-states1/5 SRAM tables with one-based state numbers.
+ *
+ * Both OPP tables stop at the state iBoot leaves each cluster in (E1 900 MHz,
+ * P4 1800 MHz), so no core runs faster or hotter than before. Higher states
+ * need a CPU thermal policy (apple,fast-die-effort) first.
+ *
+ * capacity-dmips-mhz is measured: at 900 and 1800 MHz an E core did 0.324x
+ * the work of a P core, so E = 0.324 * 1800 / 900 * 1024 = 663. arch_topology
+ * scales it by each cluster's maximum OPP, giving E cores capacity 331.
  */
-&cpu_e0 { capacity-dmips-mhz = <331>; };
-&cpu_e1 { capacity-dmips-mhz = <331>; };
-&cpu_e2 { capacity-dmips-mhz = <331>; };
-&cpu_e3 { capacity-dmips-mhz = <331>; };
-&cpu_e4 { capacity-dmips-mhz = <331>; };
-&cpu_e5 { capacity-dmips-mhz = <331>; };
-&cpu_p0 { capacity-dmips-mhz = <1024>; };
-&cpu_p1 { capacity-dmips-mhz = <1024>; };
-&cpu_p2 { capacity-dmips-mhz = <1024>; };
-&cpu_p3 { capacity-dmips-mhz = <1024>; };
+&soc {
+	cpufreq_e: cpufreq@210e20000 {
+		compatible = "apple,t8132-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+		reg = <0x2 0x10e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	cpufreq_p: cpufreq@211e20000 {
+		compatible = "apple,t8132-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+		reg = <0x2 0x11e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+};
+
+/ {
+	ecluster_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-level = <1>;
+		};
+	};
+
+	pcluster_opp: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <912000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1260000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1512000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1800000000>;
+			opp-level = <4>;
+		};
+	};
+};
+
+&cpu_e0 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	capacity-dmips-mhz = <663>;
+};
+
+&cpu_e1 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	capacity-dmips-mhz = <663>;
+};
+
+&cpu_e2 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	capacity-dmips-mhz = <663>;
+};
+
+&cpu_e3 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	capacity-dmips-mhz = <663>;
+};
+
+&cpu_e4 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	capacity-dmips-mhz = <663>;
+};
+
+&cpu_e5 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	capacity-dmips-mhz = <663>;
+};
+
+&cpu_p0 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	capacity-dmips-mhz = <1024>;
+};
+
+&cpu_p1 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	capacity-dmips-mhz = <1024>;
+};
+
+&cpu_p2 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	capacity-dmips-mhz = <1024>;
+};
+
+&cpu_p3 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	capacity-dmips-mhz = <1024>;
+};
