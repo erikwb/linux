@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! PMP-owned cooling requests and retained-session performance ceiling.
+//! PMP-owned cooling requests, retained-session performance ceiling and the
+//! utilization governor.
 //!
 //! The firmware owns voltage and clock transitions through PMP. The host
 //! consumes PMP-owner telemetry and publishes only three Globals selectors,
 //! in hundredths of a performance state. Firmware power tables and policy
 //! words from other GPU generations are never modified here.
+//!
+//! The firmware runs at the published state, busy or not, so the host requests
+//! one from the GPU's busy share of each window, bounded by the ceiling.
 
 pub(crate) mod policy;
 
@@ -16,7 +20,7 @@ use super::fw::initdata::globals;
 use super::recovery::now_ns;
 use super::regs::wmb;
 use super::Firmware;
-use policy::{COOLING_MAX, PSTATE_MAX};
+use policy::{COOLING_MAX, FLOOR, PSTATE_MAX};
 
 static_assert!(globals::PSTATE_SELECTORS[0] == 0x88);
 static_assert!(globals::PSTATE_SELECTORS[1] == 0x8c);
@@ -113,6 +117,11 @@ pub(crate) struct Power {
     pub(crate) sensor_errors: u64,
     pub(crate) decisions: u64,
     last_decision: Option<(u32, u32, u32, u32, Option<Error>)>,
+    /// Governor request, the start of its window and the busy time within it.
+    pub(crate) demand: u32,
+    window_ns: u64,
+    busy_since: Option<u64>,
+    busy_ns: u64,
 }
 
 impl Power {
@@ -139,7 +148,47 @@ impl Power {
             sensor_errors: 0,
             decisions: 0,
             last_decision: None,
+            demand: FLOOR,
+            window_ns: 0,
+            busy_since: None,
+            busy_ns: 0,
         })
+    }
+
+    /// The engine published work; it stays busy until [`Power::idle`].
+    pub(crate) fn busy(&mut self, now: u64) {
+        self.busy_since.get_or_insert(now);
+    }
+
+    /// The engine drained.
+    pub(crate) fn idle(&mut self, now: u64) {
+        if let Some(since) = self.busy_since.take() {
+            self.busy_ns += now.saturating_sub(since);
+        }
+    }
+
+    /// Whether an idle engine still has a state above the floor to give back.
+    pub(crate) fn decaying(&self) -> bool {
+        self.busy_since.is_none() && self.demand > FLOOR
+    }
+
+    /// Closes the window once it is due and returns the state to publish.
+    fn govern(&mut self, now: u64, limit: u32, busy: bool) -> u32 {
+        // Recovery can drop flights without a drain.
+        if !busy {
+            self.idle(now);
+        }
+        let window = now.wrapping_sub(self.window_ns);
+        if window >= policy::WINDOW_NS {
+            if let Some(since) = self.busy_since.as_mut() {
+                self.busy_ns += now.saturating_sub(*since);
+                *since = now;
+            }
+            self.demand = policy::demand(self.demand.min(limit), self.busy_ns, window);
+            self.window_ns = now;
+            self.busy_ns = 0;
+        }
+        self.demand.min(limit)
     }
 
     fn ceiling(&mut self, now: u64) -> (u32, bool) {
@@ -184,6 +233,9 @@ impl Firmware {
         }
         let now = now_ns();
         let (limit, decision) = self.power.ceiling(now);
+        let target = self
+            .power
+            .govern(now, limit, !self.engine.flights.is_empty());
         if decision {
             dev_info!(
                 self.dev(),
@@ -197,15 +249,15 @@ impl Firmware {
                 limit
             );
         }
-        if limit == self.power.effective {
+        if target == self.power.effective {
             return Ok(());
         }
         let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
         for offset in globals::PSTATE_SELECTORS {
-            globals.w32(offset, limit * 100)?;
+            globals.w32(offset, target * 100)?;
         }
         wmb();
-        self.power.effective = limit;
+        self.power.effective = target;
         self.power.updates += 1;
         Ok(())
     }
