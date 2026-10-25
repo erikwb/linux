@@ -40,6 +40,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
 #include <linux/swab.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
@@ -310,6 +311,8 @@ struct apple_dart {
 	struct apple_dart_dcp *dcp;
 	struct apple_dart_dcp *frontend[2];
 	bool preserve_display;
+	/* Retained radio/display state left in place across suspend-to-idle. */
+	bool s2idle_kept;
 	/* Resources reachable by a retained domain outlive device removal. */
 	bool retained;
 	bool retained_mtp;
@@ -4583,24 +4586,9 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 	.ttbr_count = 1,
 };
 
-static __maybe_unused int apple_dart_suspend(struct device *dev)
+static void apple_dart_save_state(struct apple_dart *dart)
 {
-	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
-
-	dart->tunnel_state_restored = false;
-	if (READ_ONCE(dart->commands_gated))
-		return 0;
-	/* Neither retained radio nor display has a qualified suspend boundary. */
-	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
-		return -EBUSY;
-	/* The tunneled DART has no state to save when its domain stays on. */
-	if (dart->power_retained || dart->retained_mtp)
-		return 0;
-
-	/* Locked DARTs can't be restored so skip saving their registers. */
-	if (dart->locked)
-		return 0;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		dart->save_tcr[sid] = apple_dart_readl(dart,
@@ -4610,7 +4598,37 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 				apple_dart_readl(dart,
 						 DART_TTBR(dart, sid, idx));
 	}
+}
 
+static __maybe_unused int apple_dart_suspend(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	dart->tunnel_state_restored = false;
+	if (READ_ONCE(dart->commands_gated))
+		return 0;
+	/*
+	 * Retained radio and display DMA has no suspend boundary of its own.
+	 * Suspend-to-idle leaves it running in place: these DARTs have no
+	 * power domain here, and the DCP keeps the display domains on. The
+	 * registers are saved only for resume to check.
+	 */
+	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart)) {
+		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+			return -EBUSY;
+		apple_dart_save_state(dart);
+		dart->s2idle_kept = true;
+		return 0;
+	}
+	/* The tunneled DART has no state to save when its domain stays on. */
+	if (dart->power_retained || dart->retained_mtp)
+		return 0;
+
+	/* Locked DARTs can't be restored so skip saving their registers. */
+	if (dart->locked)
+		return 0;
+
+	apple_dart_save_state(dart);
 	return 0;
 }
 
@@ -4680,8 +4698,17 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	unsigned int sid, idx;
 	int ret;
 
-	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
-		return -EBUSY;
+	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart)) {
+		if (!dart->s2idle_kept)
+			return -EBUSY;
+		dart->s2idle_kept = false;
+		/* Live DMA cannot be restored from a copy; it must not have moved. */
+		if (!apple_dart_state_retained(dart)) {
+			dev_err(dev, "retained DMA state lost in suspend-to-idle\n");
+			return -EIO;
+		}
+		return 0;
+	}
 
 	/* PCIe-C restored these mappings before starting its downstream link. */
 	if (dart->tunnel_state_restored) {
