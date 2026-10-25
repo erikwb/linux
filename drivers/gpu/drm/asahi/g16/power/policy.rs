@@ -31,7 +31,13 @@ pub(crate) fn utilization(busy: u64, window: u64) -> u32 {
     if window == 0 {
         100
     } else {
-        (busy.min(window) as u128 * 100 / window as u128) as u32
+        let busy = busy.min(window);
+        // No 128-bit division in the kernel; a window near u64::MAX loses nothing.
+        let util = match busy.checked_mul(100) {
+            Some(scaled) => scaled / window,
+            None => busy / (window / 100),
+        };
+        util.min(100) as u32
     }
 }
 
