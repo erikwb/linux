@@ -847,8 +847,8 @@ impl Firmware {
             super::recovery::logic::FIRMWARE_STAMP_PERIOD, self.engine.ordinal, self.engine.draw)?;
         writeln!(
             f,
-            "power: governor {} budget {} demand S{} effective S{} temperature_mc {} updates {} sensor_errors {}",
-            self.power.governor, self.power.budget, self.power.demand, self.power.effective,
+            "power: governor {} budget {} demand S{} utilization {} effective S{} temperature_mc {} updates {} sensor_errors {}",
+            self.power.governor, self.power.budget, self.power.demand, self.power.average, self.power.effective,
             self.power.temperature_mc, self.power.updates, self.power.sensor_errors
         )?;
         writeln!(

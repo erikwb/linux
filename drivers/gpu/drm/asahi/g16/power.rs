@@ -117,8 +117,10 @@ pub(crate) struct Power {
     pub(crate) sensor_errors: u64,
     pub(crate) decisions: u64,
     last_decision: Option<(u32, u32, u32, u32, Option<Error>)>,
-    /// Governor request, the start of its window and the busy time within it.
+    /// Governor request, smoothed utilization, the start of the window and the
+    /// busy time within it.
     pub(crate) demand: u32,
+    pub(crate) average: u32,
     window_ns: u64,
     busy_since: Option<u64>,
     busy_ns: u64,
@@ -149,6 +151,7 @@ impl Power {
             decisions: 0,
             last_decision: None,
             demand: FLOOR,
+            average: 0,
             window_ns: 0,
             busy_since: None,
             busy_ns: 0,
@@ -184,7 +187,9 @@ impl Power {
                 self.busy_ns += now.saturating_sub(*since);
                 *since = now;
             }
-            self.demand = policy::demand(self.demand.min(limit), self.busy_ns, window);
+            let util = policy::utilization(self.busy_ns, window);
+            self.average = policy::smooth(self.average, util, window);
+            self.demand = policy::demand(self.demand.min(limit), util, self.average);
             self.window_ns = now;
             self.busy_ns = 0;
         }

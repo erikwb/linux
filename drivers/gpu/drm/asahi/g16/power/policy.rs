@@ -26,21 +26,38 @@ pub(crate) fn limit(configured: u32, ceiling: u32, user: u32) -> u32 {
     ceiling.min(PSTATE_MAX).min(configured).min(user).max(1)
 }
 
-/// The state to request after a window in which the GPU was busy for `busy`
-/// of `window` ns, from the `current` published one: the top state under heavy
-/// load, a step up or down around a 30-60% band, and the floor when idle.
-pub(crate) fn demand(current: u32, busy: u64, window: u64) -> u32 {
-    let util = if window == 0 {
+/// Percentage of `window` ns the GPU was busy for.
+pub(crate) fn utilization(busy: u64, window: u64) -> u32 {
+    if window == 0 {
         100
     } else {
-        busy.min(window) * 100 / window
-    };
-    let next = match util {
-        85.. => PSTATE_MAX,
-        60..=84 => current.saturating_add(1),
-        30..=59 => current,
-        10..=29 => current.saturating_sub(1),
-        _ => FLOOR,
+        (busy.min(window) as u128 * 100 / window as u128) as u32
+    }
+}
+
+/// Utilization averaged over about four windows; a longer gap restarts it.
+pub(crate) fn smooth(average: u32, util: u32, window: u64) -> u32 {
+    if window >= 4 * WINDOW_NS {
+        util
+    } else {
+        (3 * average.min(100) + util.min(100)) / 4
+    }
+}
+
+/// The state to request from the `current` published one: up on the last
+/// window's utilization `util`, to the top state under heavy load, and down
+/// on the smoothed `average`, to the floor when idle.
+pub(crate) fn demand(current: u32, util: u32, average: u32) -> u32 {
+    let next = if util >= 70 {
+        PSTATE_MAX
+    } else if util >= 40 {
+        current.saturating_add(1)
+    } else if average < 10 {
+        FLOOR
+    } else if average < 25 {
+        current.saturating_sub(1)
+    } else {
+        current
     };
     next.clamp(FLOOR, PSTATE_MAX)
 }
@@ -75,21 +92,52 @@ mod tests {
     }
 
     #[test]
-    fn demand_follows_utilization_within_the_governed_range() {
+    fn utilization_is_a_bounded_share_of_the_window() {
         let w = WINDOW_NS;
-        assert_eq!(demand(FLOOR, w, w), PSTATE_MAX);
-        assert_eq!(demand(FLOOR, 2 * w, w), PSTATE_MAX);
-        assert_eq!(demand(4, w * 7 / 10, w), 5);
-        assert_eq!(demand(PSTATE_MAX, w * 7 / 10, w), PSTATE_MAX);
-        assert_eq!(demand(6, w / 2, w), 6);
-        assert_eq!(demand(6, w / 5, w), 5);
-        assert_eq!(demand(PSTATE_MAX, 0, w), FLOOR);
-        assert_eq!(demand(PSTATE_MAX, 0, 100 * w), FLOOR);
-        assert_eq!(demand(1, w / 2, w), FLOOR);
-        assert_eq!(demand(FLOOR, w, 0), PSTATE_MAX);
+        assert_eq!(utilization(0, w), 0);
+        assert_eq!(utilization(w / 4, w), 25);
+        assert_eq!(utilization(w, w), 100);
+        assert_eq!(utilization(2 * w, w), 100);
+        assert_eq!(utilization(0, 0), 100);
+        assert_eq!(utilization(u64::MAX, u64::MAX), 100);
+    }
+
+    #[test]
+    fn the_average_decays_and_restarts_after_a_gap() {
+        let w = WINDOW_NS;
+        assert_eq!(smooth(100, 0, w), 75);
+        assert_eq!(smooth(0, 100, w), 25);
+        assert_eq!(smooth(100, 0, 4 * w), 0);
+        assert_eq!(smooth(u32::MAX, u32::MAX, w), 100);
+        let mut average = 100;
+        let mut windows = 0;
+        while demand(PSTATE_MAX, 0, average) != FLOOR {
+            average = smooth(average, 0, w);
+            windows += 1;
+        }
+        assert!(windows <= 10);
+    }
+
+    #[test]
+    fn demand_rises_fast_and_falls_on_the_average() {
+        assert_eq!(demand(FLOOR, 100, 0), PSTATE_MAX);
+        assert_eq!(demand(FLOOR, 70, 0), PSTATE_MAX);
+        assert_eq!(demand(4, 50, 0), 5);
+        assert_eq!(demand(PSTATE_MAX, 50, 0), PSTATE_MAX);
+        // A short dip under a busy average holds the state.
+        assert_eq!(demand(PSTATE_MAX, 5, 80), PSTATE_MAX);
+        assert_eq!(demand(6, 30, 30), 6);
+        assert_eq!(demand(6, 20, 20), 5);
+        assert_eq!(demand(PSTATE_MAX, 0, 5), FLOOR);
+        // A light 60 fps load near 25% busy settles on the floor.
+        assert_eq!(demand(FLOOR, 25, 24), FLOOR);
+        assert_eq!(demand(1, 30, 30), FLOOR);
         for current in [0, 1, FLOOR, 7, PSTATE_MAX, u32::MAX] {
-            for busy in [0, w / 5, w / 2, w * 7 / 10, w] {
-                assert!((FLOOR..=PSTATE_MAX).contains(&demand(current, busy, w)));
+            for util in [0, 20, 50, 70, 100, u32::MAX] {
+                for average in [0, 9, 20, 30, 100, u32::MAX] {
+                    let next = demand(current, util, average);
+                    assert!((FLOOR..=PSTATE_MAX).contains(&next));
+                }
             }
         }
     }
