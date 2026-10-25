@@ -177,6 +177,9 @@ pub(crate) struct PlatformProfile {
     pub(crate) keybag_create: KeybagCreate,
     /// Require nonce authentication and signed sensor material before capture.
     pub(crate) nonce_session: bool,
+    /// Firmware name of the sensor's signed root-key container, which the
+    /// nonce session loads. Per-device data from the factory cache.
+    pub(crate) root_key: Option<&'static CStr>,
     /// Key-store protocol generation (see [`KeyStore`]).
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
@@ -219,6 +222,7 @@ pub(crate) const T8103: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
+    root_key: None,
     // macOS shares this enclave: keep Linux to its own xART records.
     xart_guard: 1,
 };
@@ -259,6 +263,7 @@ pub(crate) const T6000: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
+    root_key: None,
     // As T8103. On J316s, creating the identity keybag also rewrites a
     // session record that predates Linux. The guard refuses that, so the
     // keybag can only be created there with xart_guard=0.
@@ -294,6 +299,7 @@ pub(crate) const T6020: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
+    root_key: None,
     // A warm-attach enclave shared with macOS, as on T8112.
     xart_guard: 1,
 };
@@ -349,6 +355,7 @@ pub(crate) const T8140: PlatformProfile = PlatformProfile {
         arg: -1,
     },
     nonce_session: true,
+    root_key: Some(c"apple/msrk-j700.bin"),
     // Linux records from before the guard's list exist here, and Linux has
     // left the macOS records unchanged on this platform.
     xart_guard: 0,
@@ -395,6 +402,7 @@ pub(crate) const T8112: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
+    root_key: None,
     // Guarded from its first Linux boot (2026-10-16): no record refused.
     xart_guard: 1,
 };

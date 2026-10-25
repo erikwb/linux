@@ -2183,9 +2183,11 @@ impl SepData {
         self.sensor_trace(c"SENSOR_NONCE");
 
         if !self.sensor_key_loaded.load(Relaxed) {
-            let firmware = match kernel::firmware::Firmware::request(
-                c"apple/msrk-j700.bin", &self.dev,
-            ) {
+            let Some(name) = self.profile.root_key else {
+                dev_err!(self.dev, "sensor: no signed root-key container for this platform\n");
+                return false;
+            };
+            let firmware = match kernel::firmware::Firmware::request(name, &self.dev) {
                 Ok(firmware) => firmware,
                 Err(error) => {
                     dev_err!(
