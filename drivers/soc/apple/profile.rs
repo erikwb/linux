@@ -434,6 +434,30 @@ pub(crate) const T8122: PlatformProfile = PlatformProfile {
     ..T8112
 };
 
+/// MacBook Air M4 (J713). The J713 ADT (26.6.2, 25G83) puts the Mesa sensor
+/// on spi2 at `0x3ad108000`, 8 MHz, chip select 0, with power on the NUB GPIO
+/// controller (pin 28) and data-ready on AP GPIO 199. The SEP is
+/// `iop-sep,ascwrap-v6` behind a DART with the BIT(40) input alias, so the SoC
+/// side is J613's.
+///
+/// The sensor is J700's generation (`V3`, 0x3356), not J613's (`R3`): the
+/// enclave refuses the R3 SESSION_SHARE (status 0x16) and its factory
+/// calibration is an FSC2 image. So it takes J700's SPI mode 2, nonce session
+/// and signed root key. J713 on OS firmware 26.6.2 provisions its keybag,
+/// enrols, matches and restores the enrolment after a reboot.
+pub(crate) const T8132: PlatformProfile = PlatformProfile {
+    name: "T8132/J713",
+    sensor: SensorProfile {
+        controller_base: 0x3_ad10_8000,
+        mode: SpiMode::Mode2,
+        expected_id: 0x3356,
+        ..T8122.sensor
+    },
+    nonce_session: true,
+    root_key: Some(c"apple/msrk-j713.bin"),
+    ..T8122
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -449,6 +473,9 @@ static_assert!(T8112.sensor.controller_base == T8103.sensor.controller_base);
 static_assert!(T8122.shmem_capacity == T8112.shmem_capacity);
 static_assert!(T8122.sensor.controller_base == 0x2a1108000);
 static_assert!(T8122.wide_dma_mask);
+static_assert!(T8132.sensor.controller_base == 0x3ad108000);
+static_assert!(T8132.sensor.expected_id == T8140.sensor.expected_id);
+static_assert!(T8132.nonce_session && T8132.wide_dma_mask);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -594,6 +621,10 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     // J504) share the SoC but their sensor wiring is unchecked.
     if machine_has(b"apple,t8122") && (machine_has(b"apple,j613") || machine_has(b"apple,j615")) {
         return Ok(&T8122);
+    }
+    // Only J713: the other T8132 Macs are unread.
+    if machine_has(b"apple,t8132") && machine_has(b"apple,j713") {
+        return Ok(&T8132);
     }
     Err(ENODEV)
 }
