@@ -51,6 +51,8 @@ struct apple_pmgr_ps {
 	bool externally_clocked;
 	bool system_sleep;
 	bool firmware_owned;
+	/* apple,sleep-retained: kept on while the system sleeps */
+	bool sleep_retained;
 	bool inherited_on;
 	bool no_auto_enable;
 	bool needs_reset_idle_wait;
@@ -227,6 +229,9 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 	if (ps->firmware_owned)
 		return 0;
 	if (ps->inherited_on)
+		return -EBUSY;
+	/* A live coprocessor keeps this domain through system sleep. */
+	if (ps->sleep_retained && ps->system_sleep)
 		return -EBUSY;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
@@ -435,6 +440,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 * vote and never read, reset or change the hardware state.
 	 */
 	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
+	ps->sleep_retained = of_property_read_bool(node, "apple,sleep-retained");
 	/*
 	 * Only T8132 hands over inherited-on domains with this contract. Older
 	 * M3 device trees carry the property with another meaning; keep them
@@ -442,7 +448,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 */
 	ps->inherited_on = t8132 && of_property_read_bool(node, "apple,inherited-on");
 	if (ps->inherited_on &&
-	    (ps->firmware_owned || of_property_present(node, "apple,min-state") ||
+	    (ps->firmware_owned || ps->sleep_retained ||
+	     of_property_present(node, "apple,min-state") ||
 	     of_property_present(node, "apple,always-on") ||
 	     of_property_present(node, "apple,force-disable") ||
 	     of_property_present(node, "apple,force-reset") ||
