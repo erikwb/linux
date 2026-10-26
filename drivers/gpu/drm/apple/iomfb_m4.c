@@ -21,6 +21,7 @@
 #include <linux/crc32.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/minmax.h>
 #include <linux/workqueue.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_modes.h>
@@ -73,7 +74,7 @@ struct iomfb_m4 {
 	bool powered_off; /* setPowerState(0) for system sleep */
 	bool display_off; /* setPowerState(0) while blanked, until the next frame */
 	u64 display_off_cycles;
-	s64 display_on_us;
+	s64 display_off_us, display_off_us_max, display_on_us, display_on_us_max;
 	/* Exact completed successor or blank is the only framebuffer retirement. */
 	struct drm_framebuffer *active_fb;
 	struct drm_framebuffer *uncertain_fb;
@@ -1311,6 +1312,8 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
 		if (!ret) {
 			dcp->display_off = false;
 			dcp->display_on_us = ktime_us_delta(ktime_get(), start);
+			dcp->display_on_us_max = max(dcp->display_on_us,
+						     dcp->display_on_us_max);
 		}
 	}
 	if (ret)
@@ -1356,11 +1359,18 @@ int iomfb_m4_blank(struct apple_dcp *owner)
 		dcp->blanks++;
 		/*
 		 * Nothing is scanned out until the next frame: power the display
-		 * down as system sleep does. A refusal leaves it blanked and on.
+		 * down as system sleep does. A refusal fails the session, as there.
 		 */
-		if (!dcp->display_off && !dcp_m4_set_power_state(dcp, false)) {
-			dcp->display_off = true;
-			dcp->display_off_cycles++;
+		if (!dcp->display_off) {
+			ktime_t start = ktime_get();
+
+			if (!dcp_m4_set_power_state(dcp, false)) {
+				dcp->display_off = true;
+				dcp->display_off_cycles++;
+				dcp->display_off_us = ktime_us_delta(ktime_get(), start);
+				dcp->display_off_us_max = max(dcp->display_off_us,
+							      dcp->display_off_us_max);
+			}
 		}
 	}
 	mutex_unlock(&dcp->lock);
@@ -1525,8 +1535,10 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "flips=%llu blanks=%llu backlight_swaps=%llu active=%u uncertain=%u\n",
 		   dcp->flips, dcp->blanks, dcp->brightness_swaps,
 		   !!dcp->active_fb, !!dcp->uncertain_fb);
-	seq_printf(s, "display_off=%u off_cycles=%llu last_power_on_us=%lld\n",
-		   dcp->display_off, dcp->display_off_cycles, dcp->display_on_us);
+	seq_printf(s, "display_off=%u off_cycles=%llu off_us=%lld/%lld on_us=%lld/%lld\n",
+		   dcp->display_off, dcp->display_off_cycles,
+		   dcp->display_off_us, dcp->display_off_us_max,
+		   dcp->display_on_us, dcp->display_on_us_max);
 	mutex_unlock(&dcp->lock);
 	return 0;
 }
