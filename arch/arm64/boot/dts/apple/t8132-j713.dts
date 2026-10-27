@@ -425,7 +425,6 @@
 	      <0x4 0x0b050000 0x0 0x4000>;
 	reg-names = "usb2phy", "pipehandler", "core", "axi2af", "lioa",
 		    "fabric", "common-config";
-	power-domains = <&ps_atc1_common>;
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;

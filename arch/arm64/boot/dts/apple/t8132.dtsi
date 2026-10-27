@@ -1063,6 +1063,7 @@
 
 		#phy-cells = <1>;
 		#reset-cells = <0>;
+		power-domains = <&ps_atc0_usb>;
 		orientation-switch;
 		mode-switch;
 
@@ -1121,6 +1122,7 @@
 
 		#phy-cells = <1>;
 		#reset-cells = <0>;
+		power-domains = <&ps_atc1_usb>;
 		orientation-switch;
 		mode-switch;
 
