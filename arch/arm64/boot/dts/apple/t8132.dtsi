@@ -1076,6 +1076,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
 	};
 
 	dwc3_0_dart_1: iommu@402f80000 {
@@ -1085,6 +1086,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
 	};
 
 	dwc3_0: usb@402280000 {
@@ -1102,6 +1104,7 @@
 		role-switch-default-mode = "host";
 
 		iommus = <&dwc3_0_dart_0 0>, <&dwc3_0_dart_1 1>;
+		power-domains = <&ps_atc0_usb>;
 		resets = <&atcphy0>;
 		phys = <&atcphy0 PHY_TYPE_USB2>;
 		phy-names = "usb2-phy";
@@ -1131,6 +1134,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1345 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
 	};
 
 	dwc3_1_dart_1: iommu@40af80000 {
@@ -1140,6 +1144,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1345 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
 	};
 
 	dwc3_1: usb@40a280000 {
@@ -1157,6 +1162,7 @@
 		role-switch-default-mode = "host";
 
 		iommus = <&dwc3_1_dart_0 0>, <&dwc3_1_dart_1 1>;
+		power-domains = <&ps_atc1_usb>;
 		resets = <&atcphy1>;
 		phys = <&atcphy1 PHY_TYPE_USB2>;
 		phy-names = "usb2-phy";

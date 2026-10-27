@@ -123,6 +123,7 @@
  * @usb3_power_off_pending: Core-owned USB3 references still to release
  * @idle_rpm: Let the controller runtime-suspend while the core is down
  * @rpm_held: The glue holds a runtime PM reference for the running core
+ * @pre_core_rpm: Runtime PM is the glue's own until the first core bring-up
  * @drd_cfg: The controller's configuration block (optional, for its tunable)
  * @tunables: Controller tunables from the device tree, see dwc3_apple_tunable_list
  */
@@ -151,6 +152,7 @@ struct dwc3_apple {
 	unsigned long usb3_power_off_pending;
 	bool idle_rpm;
 	bool rpm_held;
+	bool pre_core_rpm;
 
 	void __iomem *drd_cfg;
 	struct apple_tunable *tunables[DWC3_APPLE_NR_TUNABLES];
@@ -524,6 +526,19 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	}
 
 	/*
+	 * Power an idle port's controller up for its first core probe, then leave runtime PM
+	 * to dwc3_core_probe(), which expects it disabled with the device active.
+	 */
+	if (appledwc->pre_core_rpm) {
+		ret = pm_runtime_resume_and_get(appledwc->dev);
+		if (ret)
+			return ret;
+		pm_runtime_disable(appledwc->dev);
+		pm_runtime_put_noidle(appledwc->dev);
+		appledwc->pre_core_rpm = false;
+	}
+
+	/*
 	 * Before the first core probe runtime PM is not enabled yet and the controller stays
 	 * powered; dwc3_apple_core_probe() takes the reference then.
 	 */
@@ -839,8 +854,9 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
 	appledwc->host_only = dwc3_apple_host_only(dev);
-	/* Tested on T6040 only, where the PHY driver and the DARTs follow runtime PM. */
-	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3");
+	/* Where the PHY driver and the DARTs follow runtime PM. */
+	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
+			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");
 	mutex_init(&appledwc->lock);
 	/* A never-connected port has no generic core probe to publish this. */
 	appledwc->dwc.dev = dev;
@@ -906,9 +922,23 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * details.
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
+	/*
+	 * Until the first cable there is no core to keep powered: let the controller
+	 * runtime-suspend, and its DARTs with it, so that its power domain can drop.
+	 * Checked on T8132 only.
+	 */
+	if (appledwc->idle_rpm && !appledwc->fixed_hub &&
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dwc3")) {
+		pm_runtime_set_active(dev);
+		pm_runtime_enable(dev);
+		appledwc->pre_core_rpm = true;
+	}
 	ret = dwc3_apple_setup_role_switch(appledwc);
-	if (ret)
+	if (ret) {
+		if (appledwc->pre_core_rpm)
+			pm_runtime_disable(dev);
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
+	}
 
 	if (!appledwc->fixed_hub)
 		return 0;
@@ -951,6 +981,8 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 		dev_err(appledwc->dev, "Removal left pending PHY/reset cleanup\n");
 	if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
 		dwc3_core_remove_no_shutdown(&appledwc->dwc);
+	if (appledwc->pre_core_rpm)
+		pm_runtime_disable(appledwc->dev);
 }
 
 /* Stop the consumer and release its PHY epoch before the supplier shutdown. */
