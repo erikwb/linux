@@ -790,6 +790,14 @@
 		status = "disabled"; /* Locked, don't touch it */
 	};
 
+	ps_isp_sys: power-controller@530 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x530 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sys";
+	};
+
 	ps_ans: power-controller@538 {
 		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x538 4>;

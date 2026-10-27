@@ -380,6 +380,11 @@
 	status = "disabled";
 };
 
+/* No camera driver yet; genpd powers the ISP down as an unused domain. */
+&ps_isp_sys {
+	status = "okay";
+};
+
 &ps_ans {
 	status = "okay";
 };
