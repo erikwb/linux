@@ -149,6 +149,7 @@ static const struct of_device_id simple_pm_bus_of_match[] = {
 	{ .compatible = "apple,t8015-pmgr",	.data = ONLY_BUS },
 	{ .compatible = "apple,t8103-pmgr",	.data = ONLY_BUS },
 	{ .compatible = "apple,t8112-pmgr",	.data = ONLY_BUS },
+	{ .compatible = "apple,t8132-pmgr",	.data = ONLY_BUS },
 	{ .compatible = "apple,t6000-pmgr",	.data = ONLY_BUS },
 	{ .compatible = "apple,t6020-pmgr",	.data = ONLY_BUS },\
 	{ .compatible = "fsl,ls1021a-scfg", },
