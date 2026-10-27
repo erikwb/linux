@@ -83,6 +83,8 @@ static struct {
 
 /* Read-only cadence diagnostics: reading temperatures must not advance these. */
 module_param_named(sample_count, pmp_thermal.sample_count, ullong, 0444);
+static bool force_fast_poll;
+module_param(force_fast_poll, bool, 0644);
 module_param_named(governor_count, pmp_thermal.governor_count, ullong, 0444);
 module_param_named(ready, pmp_thermal.ready, bool, 0444);
 
@@ -493,7 +495,7 @@ static enum hrtimer_restart apple_pmp_poll_timer(struct hrtimer *timer)
 	 * One work item coalesces missed ticks; no burst of stale confirmations.
 	 */
 	queue_work(system_highpri_wq, &pmp_thermal.poll_work);
-	hrtimer_forward_now(timer, ms_to_ktime(READ_ONCE(pmp_thermal.fast_poll) ?
+	hrtimer_forward_now(timer, ms_to_ktime((READ_ONCE(pmp_thermal.fast_poll) || READ_ONCE(force_fast_poll)) ?
 					     APPLE_PMP_POLL_MS :
 					     APPLE_PMP_SLOW_POLL_MS));
 	return HRTIMER_RESTART;
