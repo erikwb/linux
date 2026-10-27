@@ -8,6 +8,8 @@
 #include <kunit/static_stub.h>
 
 #include <linux/bitfield.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
@@ -451,6 +453,52 @@ static void apple_smc_disable_notifications(void *data)
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
 }
 
+/*
+ * TEST: debugfs "macsmc/keys" lists every key: name, type, size, flags and,
+ * for readable non-function keys up to 32 bytes, the current raw value.
+ */
+static int apple_smc_keys_show(struct seq_file *s, void *unused)
+{
+	struct apple_smc *smc = s->private;
+	struct apple_smc_key_info info;
+	u8 buf[32];
+	smc_key key;
+	u32 i;
+	int ret;
+
+	for (i = 0; i < smc->key_count; i++) {
+		ret = apple_smc_get_key_by_index(smc, i, &key);
+		if (ret) {
+			seq_printf(s, "#%u index error %d\n", i, ret);
+			continue;
+		}
+		ret = apple_smc_get_key_info(smc, key, &info);
+		seq_printf(s, "%c%c%c%c", key >> 24, key >> 16, key >> 8, key);
+		if (ret) {
+			seq_printf(s, " info error %d\n", ret);
+			continue;
+		}
+		seq_printf(s, " %c%c%c%c %u %02x", info.type_code >> 24, info.type_code >> 16,
+			   info.type_code >> 8, info.type_code, info.size, info.flags);
+		if ((info.flags & APPLE_SMC_READABLE) && !(info.flags & APPLE_SMC_FUNCTION) &&
+		    info.size && info.size <= sizeof(buf)) {
+			ret = apple_smc_read(smc, key, buf, info.size);
+			if (ret < 0)
+				seq_printf(s, " read error %d", ret);
+			else
+				seq_printf(s, " %*phN", info.size, buf);
+		}
+		seq_putc(s, '\n');
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(apple_smc_keys);
+
+static void apple_smc_debugfs_remove(void *data)
+{
+	debugfs_remove_recursive(data);
+}
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -516,6 +564,13 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
+
+	{
+		struct dentry *dir = debugfs_create_dir("macsmc", NULL);
+
+		debugfs_create_file("keys", 0400, dir, smc, &apple_smc_keys_fops);
+		devm_add_action_or_reset(dev, apple_smc_debugfs_remove, dir);
+	}
 
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
