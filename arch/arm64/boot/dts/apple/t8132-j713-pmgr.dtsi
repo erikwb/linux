@@ -193,7 +193,6 @@
 
 &ps_atc0_common {
 	status = "okay";
-	apple,inherited-on;
 };
 
 &ps_spi2 {
@@ -282,7 +281,6 @@
 
 &ps_atc1_common {
 	status = "okay";
-	apple,inherited-on;
 };
 
 &ps_atc1_pcie {
