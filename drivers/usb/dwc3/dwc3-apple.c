@@ -90,10 +90,11 @@
  * dwc3_apple_init(). In host mode xHCI then keeps running in suspend-to-idle when a USB device
  * may wake the system, as a halted xHC could not signal the wakeup.
  *
- * Runtime PM (T6040 only, see dwc3_apple_core_probe()): the glue holds a reference from the
- * reset deassert to the end of the shutdown, so with no cable the controller can runtime-suspend
- * and its power domain drop, its DARTs (which save and restore their state) and, through the
- * device link of its phys, the PHY with it.
+ * Runtime PM (T6040 and T8132, see dwc3_apple_core_probe()): the glue holds a reference from
+ * the reset deassert to the end of the shutdown, so with no cable the controller can
+ * runtime-suspend and its power domain drop, its DARTs (which save and restore their state) and,
+ * through the device link of its phys, the PHY with it. On T8132 a port that has not seen a cable
+ * yet can suspend as well, with runtime PM held by the glue until the first core probe.
  *
  * enum dwc3_apple_state is defined in dwc3-apple-state.h.
  */
@@ -539,8 +540,8 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	}
 
 	/*
-	 * Before the first core probe runtime PM is not enabled yet and the controller stays
-	 * powered; dwc3_apple_core_probe() takes the reference then.
+	 * Before the first core probe the controller is powered, with runtime PM off or handed
+	 * over above; dwc3_apple_core_probe() takes the reference then.
 	 */
 	if (appledwc->state != DWC3_APPLE_PROBE_PENDING && !appledwc->rpm_held) {
 		ret = pm_runtime_resume_and_get(appledwc->dev);
@@ -854,7 +855,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
 	appledwc->host_only = dwc3_apple_host_only(dev);
-	/* Where the PHY driver and the DARTs follow runtime PM. */
+	/* The PHY driver and the DARTs follow runtime PM on these SoCs. */
 	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
 			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");
 	mutex_init(&appledwc->lock);
@@ -925,7 +926,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	/*
 	 * Until the first cable there is no core to keep powered: let the controller
 	 * runtime-suspend, and its DARTs with it, so that its power domain can drop.
-	 * Checked on T8132 only.
+	 * Tested on T8132 only.
 	 */
 	if (appledwc->idle_rpm && !appledwc->fixed_hub &&
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dwc3")) {
