@@ -163,6 +163,10 @@ struct dwc3_apple {
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
 
+/* TEST: let the T8132 USB3 PHY into P3 again, from the next host start */
+static bool t8132_u3_p3;
+module_param(t8132_u3_p3, bool, 0644);
+
 /*
  * Apple Silicon dwc3 vendor-specific registers
  *
@@ -631,7 +635,7 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 		if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
 			return ret;
 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
-	} else if (host && appledwc->usb3_phy &&
+	} else if (host && appledwc->usb3_phy && !t8132_u3_p3 &&
 		   of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3")) {
 		/*
 		 * The T8132 PHY does not bring a SuperSpeed link back from U3 once
