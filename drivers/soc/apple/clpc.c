@@ -21,10 +21,17 @@
  */
 
 #include <linux/cpufreq.h>
+#include <linux/kref.h>
+#include <linux/ktime.h>
+#include <linux/of_platform.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/soc/apple/clpc.h>
 #include <linux/debugfs.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -48,6 +55,13 @@ enum apple_clpc_rail {
 #define APPLE_CLPC_BUSY_PCT	50
 /* Time a rail keeps its last request after demand stops */
 #define APPLE_CLPC_HOLD_MS	32
+/*
+ * Time the GPU floor stays released after the PMP last limited the DCS. Under
+ * sustained heavy rendering the PMP limits the DCS again well within this, so
+ * the floor stays released; light submissions that follow get the floor back
+ * this long after the PMP stops limiting.
+ */
+#define APPLE_CLPC_GPU_BACKOFF_MS	100
 
 /**
  * struct apple_clpc_hw - per-SoC CLPC parameters
@@ -56,12 +70,25 @@ enum apple_clpc_rail {
  *	0 or 1 for the first
  * @map: state of each rail for a busy cluster below 25, 50, 75 and 100
  *	percent of its maximum frequency
+ * @gpu_demand: streaming GPU work requests @gpu
+ * @gpu: state of each rail for streaming GPU work
+ * @gpu_sustain_ms: time graphics stays powered without a break before it
+ *	counts as streaming, see apple_clpc_gpu_streaming(); 0 counts it at once
+ * @pmp_backoff: release that GPU floor while the PMP, voter agent
+ *	@pmp_agent, limits the DCS, see apple_clpc_gpu_limited()
+ * @gpu_dense: submissions per sampling period that make light GPU work
+ *	dense, see apple_clpc_gpu_dense(); 0 for none
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
 	unsigned int sustain;
 	u8 map[APPLE_CLPC_RAILS][APPLE_CLPC_LEVELS];
 	bool gpu_demand;
+	u8 gpu[APPLE_CLPC_RAILS];
+	unsigned int gpu_sustain_ms;
+	bool pmp_backoff;
+	unsigned int pmp_agent;
+	unsigned int gpu_dense;
 };
 
 struct apple_clpc_cluster {
@@ -78,6 +105,16 @@ struct apple_clpc_vote {
 	unsigned long last_demand;
 };
 
+/* Independent lifetime: a late consumer put never dereferences a removed provider. */
+struct apple_clpc_gpu {
+	struct kref ref;
+	spinlock_t lock;
+	bool active;
+	u64 updated_ns;
+	u64 sequence;
+	struct delayed_work *wake;
+};
+
 struct apple_clpc {
 	struct device *dev;
 	struct device *pmc;
@@ -86,6 +123,7 @@ struct apple_clpc {
 	/* Samples while a vote is held; idle_work defers to busy CPUs. */
 	struct delayed_work work;
 	struct delayed_work idle_work;
+	struct mutex sample_lock;
 	bool stopped;
 	struct apple_clpc_cluster clusters[APPLE_CLPC_MAX_CLUSTERS];
 	unsigned int nr_clusters;
@@ -100,8 +138,143 @@ struct apple_clpc {
 	unsigned long update_errors;
 	struct dentry *debugfs;
 	struct regmap *gpu_pmgr;
+	struct apple_clpc_gpu *gpu;
+	u32 last_floor;
+	u32 last_reason;
+	u64 last_vote_ns;
 	u32 gpu_offset;
+	/* Graphics powered at the last sample, since when, and that sample's time */
+	bool gpu_on;
+	unsigned long gpu_on_since;
+	unsigned long gpu_sampled;
+	/* Submissions seen at the last sample, and dense samples in a row */
+	u64 gpu_sequence;
+	unsigned int gpu_dense_streak;
+	/* Whether, and when, the PMP last limited the DCS while GPU work streamed */
+	bool gpu_limited;
+	unsigned long gpu_limited_at;
+	/*
+	 * Whether the GPU floor was released at the last sample that saw GPU work
+	 * stream, and how often it was released and came back, for debugfs.
+	 */
+	bool gpu_floor_released;
+	unsigned long gpu_floor_releases;
+	unsigned long gpu_floor_returns;
+	/* Samples that applied the GPU floor for streaming or dense work. */
+	unsigned long gpu_streaming_samples;
+	unsigned long gpu_dense_samples;
 };
+
+/* Protect publication/removal of provider drvdata, never a submission path. */
+static DEFINE_MUTEX(apple_clpc_clients_lock);
+
+static void apple_clpc_gpu_free(struct kref *ref)
+{
+	kfree(container_of(ref, struct apple_clpc_gpu, ref));
+}
+
+void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active)
+{
+	unsigned long flags;
+
+	if (!gpu)
+		return;
+	spin_lock_irqsave(&gpu->lock, flags);
+	/* A cold GPU publisher must not wait for a deferrable CPU-idle timer.
+	 * Removal clears wake under this same lock before draining work.
+	 */
+	if (active && !gpu->active && gpu->wake)
+		mod_delayed_work(system_freezable_power_efficient_wq, gpu->wake, 0);
+	gpu->active = active;
+	gpu->updated_ns = ktime_get_mono_fast_ns();
+	gpu->sequence++;
+	spin_unlock_irqrestore(&gpu->lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_clpc_gpu_set_active);
+
+void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu)
+{
+	if (gpu) {
+		apple_clpc_gpu_set_active(gpu, false);
+		kref_put(&gpu->ref, apple_clpc_gpu_free);
+	}
+}
+EXPORT_SYMBOL_GPL(apple_clpc_gpu_put);
+
+int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
+{
+	struct device_node *np;
+	struct platform_device *provider;
+	struct apple_clpc *clpc;
+	struct device_link *link;
+	bool fallback = false;
+	int ret = -EPROBE_DEFER;
+
+	*out = NULL;
+	np = of_parse_phandle(dev->of_node, "apple,clpc", 0);
+	/*
+	 * Device trees that predate the link on the T8140 GPU still have
+	 * exactly one T8140 CLPC: take that one, as a hint the GPU can do
+	 * without, so that it never waits for a CLPC that does not probe.
+	 */
+	if (!np && !of_find_property(dev->of_node, "apple,clpc", NULL) &&
+	    of_device_is_compatible(dev->of_node, "apple,agx-t8140")) {
+		np = of_find_compatible_node(NULL, NULL, "apple,t8140-clpc");
+		fallback = true;
+		ret = 0;
+	}
+	if (!np)
+		return of_find_property(dev->of_node, "apple,clpc", NULL) ? -EINVAL : 0;
+	if (!of_device_is_compatible(np, "apple,t6041-clpc") &&
+	    !of_device_is_compatible(np, "apple,t8140-clpc")) {
+		of_node_put(np);
+		return -EINVAL;
+	}
+	provider = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!provider)
+		return ret;
+	if (fallback && !device_is_bound(&provider->dev)) {
+		put_device(&provider->dev);
+		return 0;
+	}
+	link = device_link_add(dev, &provider->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
+	if (!link) {
+		put_device(&provider->dev);
+		return -ENOMEM;
+	}
+	mutex_lock(&apple_clpc_clients_lock);
+	clpc = dev_get_drvdata(&provider->dev);
+	if (clpc && clpc->gpu && refcount_read(&clpc->gpu->ref.refcount) == 1) {
+		kref_get(&clpc->gpu->ref);
+		*out = clpc->gpu;
+		ret = 0;
+	}
+	mutex_unlock(&apple_clpc_clients_lock);
+	put_device(&provider->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_clpc_gpu_get);
+
+static bool apple_clpc_gpu_active(struct apple_clpc_gpu *gpu, u64 *updated, u64 *sequence)
+{
+	unsigned long flags;
+	bool active;
+
+	spin_lock_irqsave(&gpu->lock, flags);
+	active = gpu->active;
+	*updated = gpu->updated_ns;
+	*sequence = gpu->sequence;
+	spin_unlock_irqrestore(&gpu->lock, flags);
+	return active;
+}
+
+static void apple_clpc_gpu_owner_put(void *data)
+{
+	struct apple_clpc_gpu *gpu = data;
+
+	kref_put(&gpu->ref, apple_clpc_gpu_free);
+}
 
 /* cpufreq policies can appear after probe; pick up new ones as they do. */
 static void apple_clpc_find_clusters(struct apple_clpc *clpc)
@@ -222,9 +395,119 @@ static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 	 * stops; with no vote held, sampling can wait for a CPU that wakes up
 	 * anyway rather than waking an idle one every period.
 	 */
+	/* A demand edge can queue work while the deferrable pass is pending.
+	 * Keep one sampling cadence once the serialized pass settles.
+	 */
+	cancel_delayed_work(idle ? &clpc->work : &clpc->idle_work);
 	queue_delayed_work(system_freezable_power_efficient_wq,
 			   idle ? &clpc->idle_work : &clpc->work,
 			   msecs_to_jiffies(APPLE_CLPC_SAMPLE_MS));
+}
+
+/*
+ * Whether the GPU streams work: graphics has stayed powered for the SoC's
+ * gpu_sustain_ms, with no sample in between that found it off and no gap in
+ * sampling long enough to have missed that. The firmware powers graphics off
+ * a few milliseconds after the GPU idles, so a frame-paced load such as video
+ * playback powers it up and down with each frame and does not count. A failed
+ * read counts as powered, so read errors alone do not end a stream that is
+ * already under way.
+ */
+static bool apple_clpc_gpu_streaming(struct apple_clpc *clpc, unsigned long now)
+{
+	bool gap = time_after(now, clpc->gpu_sampled +
+				   msecs_to_jiffies(2 * APPLE_CLPC_SAMPLE_MS));
+	u32 status;
+	int err;
+
+	clpc->gpu_sampled = now;
+	err = regmap_read(clpc->gpu_pmgr, clpc->gpu_offset, &status);
+	if (!err && (status & GENMASK(7, 4)) != GENMASK(7, 4)) {
+		clpc->gpu_on = false;
+		return false;
+	}
+
+	if (!clpc->gpu_on || gap)
+		clpc->gpu_on_since = now;
+	clpc->gpu_on = true;
+	return time_after_eq(now, clpc->gpu_on_since +
+				  msecs_to_jiffies(clpc->hw->gpu_sustain_ms));
+}
+
+/* Samples in a row that light GPU work must stay dense for: one 60 Hz frame. */
+#define APPLE_CLPC_GPU_DENSE_SAMPLES	4
+
+/*
+ * Whether light GPU work is dense: at least gpu_dense submissions in each of
+ * the last GPU_DENSE_SAMPLES sampling periods. Such work keeps graphics
+ * powering up and down between submissions, so it never counts as streaming,
+ * yet each of its submissions waits on the fabric as streaming work does.
+ * Work paced by frames leaves a quieter period in every frame and stays below.
+ * @sequence counts every submission the GPU driver published; a sample late by
+ * more than one period ends a streak, as its count no longer covers one period.
+ */
+static bool apple_clpc_gpu_dense_step(unsigned int *streak, u64 *last,
+				      u64 sequence, unsigned int threshold,
+				      bool late)
+{
+	u64 submissions = sequence - *last;
+
+	*last = sequence;
+	if (!threshold || late || submissions < threshold)
+		*streak = 0;
+	else if (*streak < APPLE_CLPC_GPU_DENSE_SAMPLES)
+		(*streak)++;
+	return *streak >= APPLE_CLPC_GPU_DENSE_SAMPLES;
+}
+
+static bool apple_clpc_gpu_dense(struct apple_clpc *clpc, bool late)
+{
+	u64 updated, sequence;
+
+	if (!clpc->gpu || !clpc->hw->gpu_dense)
+		return false;
+	apple_clpc_gpu_active(clpc->gpu, &updated, &sequence);
+	return apple_clpc_gpu_dense_step(&clpc->gpu_dense_streak,
+					 &clpc->gpu_sequence, sequence,
+					 clpc->hw->gpu_dense, late);
+}
+
+/*
+ * Whether the PMP holds the GPU to a power budget: while GPU work streams, it
+ * votes the DCS below the top state, which it does under sustained heavy
+ * rendering but not for streams of light submissions. The GPU floor would
+ * then only take power and thermal headroom from the GPU, so it stays
+ * released for GPU_BACKOFF_MS after the PMP last did so.
+ */
+static bool apple_clpc_gpu_limited(struct apple_clpc *clpc, unsigned long now)
+{
+	unsigned int rail = clpc->hw->rail[APPLE_CLPC_DCS];
+	unsigned int dcs;
+
+	if (!clpc->hw->pmp_backoff)
+		return false;
+
+	dcs = (apple_pmc_floor_read(clpc->pmc, clpc->hw->pmp_agent) >>
+	       APPLE_PMC_RAIL_SHIFT(rail)) & 0xf;
+	if (dcs < clpc->hw->gpu[APPLE_CLPC_DCS]) {
+		clpc->gpu_limited = true;
+		clpc->gpu_limited_at = now;
+	}
+	return clpc->gpu_limited &&
+	       time_before(now, clpc->gpu_limited_at +
+				msecs_to_jiffies(APPLE_CLPC_GPU_BACKOFF_MS));
+}
+
+/* Count the GPU floor's releases and returns while GPU work streams. */
+static void apple_clpc_gpu_floor_count(struct apple_clpc *clpc, bool released)
+{
+	if (released == clpc->gpu_floor_released)
+		return;
+	if (released)
+		clpc->gpu_floor_releases++;
+	else
+		clpc->gpu_floor_returns++;
+	clpc->gpu_floor_released = released;
 }
 
 static void apple_clpc_sample(struct apple_clpc *clpc)
@@ -233,6 +516,7 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	unsigned int state[APPLE_CLPC_RAILS];
 	unsigned long now = jiffies;
 	unsigned int i, rail;
+	u32 reason = 0, floor;
 
 	clpc->samples++;
 	if (!cpumask_equal(clpc->covered, cpu_possible_mask) &&
@@ -248,39 +532,79 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 			demand[rail] = max(demand[rail], cl->request[rail]);
 	}
-	if (clpc->gpu_pmgr) {
-		u32 status;
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+		if (demand[rail])
+			reason |= 1;
+	if (clpc->gpu && !clpc->hw->gpu_demand) {
+		u64 updated, sequence;
 
-		/* Keep the qualified floor while graphics is powered. A failed
-		 * read must not silently starve a running graphics consumer.
-		 */
-		if (regmap_read(clpc->gpu_pmgr, clpc->gpu_offset, &status) ||
-		    (status & GENMASK(7, 4)) == GENMASK(7, 4))
+		if (apple_clpc_gpu_active(clpc->gpu, &updated, &sequence)) {
+			reason |= 2;
 			for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-				demand[rail] = clpc->hw->map[rail][APPLE_CLPC_LEVELS - 1];
+				demand[rail] = max(demand[rail],
+						clpc->hw->map[rail][APPLE_CLPC_LEVELS - 1]);
+		}
+	}
+	if (clpc->gpu_pmgr) {
+		/* Both run every sample: each tracks state across samples. */
+		bool late = time_after(now, clpc->gpu_sampled +
+					    msecs_to_jiffies(2 * APPLE_CLPC_SAMPLE_MS));
+		bool dense = apple_clpc_gpu_dense(clpc, late);
+		bool streaming = apple_clpc_gpu_streaming(clpc, now);
+
+		if (streaming || dense) {
+			bool released = apple_clpc_gpu_limited(clpc, now);
+
+			apple_clpc_gpu_floor_count(clpc, released);
+			if (!released) {
+				reason |= streaming ? 4 : 8;
+				if (streaming)
+					clpc->gpu_streaming_samples++;
+				else
+					clpc->gpu_dense_samples++;
+				for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+					demand[rail] = max(demand[rail],
+							   clpc->hw->gpu[rail]);
+			}
+		}
 	}
 
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		state[rail] = apple_clpc_vote(&clpc->vote[rail], demand[rail],
 					      now);
 
-	if (apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask,
-				   apple_clpc_floor(clpc, state)))
+	floor = apple_clpc_floor(clpc, state);
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+		if (state[rail] > demand[rail])
+			reason |= 16;
+	clpc->last_floor = floor;
+	clpc->last_reason = reason;
+	clpc->last_vote_ns = ktime_get_mono_fast_ns();
+	if (apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask, floor))
 		clpc->update_errors++;
 
-	apple_clpc_queue(clpc, !apple_clpc_floor(clpc, state));
+	/* Sample on time while graphics is powered, to see it power off. */
+	apple_clpc_queue(clpc, !apple_clpc_floor(clpc, state) && !clpc->gpu_on);
 }
 
 static void apple_clpc_work(struct work_struct *work)
 {
-	apple_clpc_sample(container_of(to_delayed_work(work), struct apple_clpc,
-				       work));
+	struct apple_clpc *clpc = container_of(to_delayed_work(work), struct apple_clpc, work);
+
+	mutex_lock(&clpc->sample_lock);
+	if (!READ_ONCE(clpc->stopped))
+		apple_clpc_sample(clpc);
+	mutex_unlock(&clpc->sample_lock);
 }
 
 static void apple_clpc_idle_work(struct work_struct *work)
 {
-	apple_clpc_sample(container_of(to_delayed_work(work), struct apple_clpc,
-				       idle_work));
+	struct apple_clpc *clpc = container_of(to_delayed_work(work), struct apple_clpc, idle_work);
+
+	mutex_lock(&clpc->sample_lock);
+	if (!READ_ONCE(clpc->stopped))
+		apple_clpc_sample(clpc);
+	mutex_unlock(&clpc->sample_lock);
 }
 
 static int apple_clpc_status_show(struct seq_file *s, void *unused)
@@ -299,8 +623,31 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 						   clpc->hw->rail[rail]),
 			   clpc->hw->map[rail][0], clpc->hw->map[rail][1],
 			   clpc->hw->map[rail][2], clpc->hw->map[rail][3]);
+	seq_printf(s, "last_vote: %#x reason_bits %#x sampled_ns %llu (cpu=1 host_gpu=2 streaming_gpu=4 dense_gpu=8 hold=16)\n",
+		   READ_ONCE(clpc->last_floor), READ_ONCE(clpc->last_reason),
+		   READ_ONCE(clpc->last_vote_ns));
+	if (clpc->gpu) {
+		u64 updated, sequence;
+		bool active = apple_clpc_gpu_active(clpc->gpu, &updated, &sequence);
+
+		seq_printf(s, "host_gpu: active %u request_ns %llu sequence %llu\n",
+			   active, updated, sequence);
+	}
 	seq_printf(s, "samples: %lu update errors: %lu\n", clpc->samples,
 		   clpc->update_errors);
+	if (clpc->gpu_pmgr) {
+		seq_printf(s, "gpu: powered %u for %u ms, pmp limited ", clpc->gpu_on,
+			   clpc->gpu_on ? jiffies_to_msecs(jiffies - clpc->gpu_on_since) : 0);
+		if (clpc->gpu_limited)
+			seq_printf(s, "%u ms ago\n",
+				   jiffies_to_msecs(jiffies - clpc->gpu_limited_at));
+		else
+			seq_puts(s, "never\n");
+		seq_printf(s, "gpu floor releases: %lu returns: %lu\n",
+			   clpc->gpu_floor_releases, clpc->gpu_floor_returns);
+		seq_printf(s, "gpu floor samples: streaming %lu dense %lu\n",
+			   clpc->gpu_streaming_samples, clpc->gpu_dense_samples);
+	}
 	for (i = 0; i < clpc->nr_clusters; i++)
 		seq_printf(s, "cluster cpu%u: busy %u%% level %u%% -> dcs %u soc %u\n",
 			   clpc->clusters[i].policy_cpu, clpc->clusters[i].busy,
@@ -346,6 +693,16 @@ static void apple_clpc_stop(void *data)
 {
 	struct apple_clpc *clpc = data;
 
+	mutex_lock(&apple_clpc_clients_lock);
+	dev_set_drvdata(clpc->dev, NULL);
+	mutex_unlock(&apple_clpc_clients_lock);
+	if (clpc->gpu) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&clpc->gpu->lock, flags);
+		clpc->gpu->wake = NULL;
+		spin_unlock_irqrestore(&clpc->gpu->lock, flags);
+	}
 	apple_clpc_halt(clpc);
 	debugfs_remove_recursive(clpc->debugfs);
 	apple_clpc_free_clusters(clpc);
@@ -365,6 +722,21 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->dev = dev;
 	clpc->pmc = dev->parent;
 	clpc->hw = of_device_get_match_data(dev);
+	/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
+	 * host publication/idle input, not that supplier state, drives demand.
+	 * On T8140 the same input counts submissions for dense light work.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t6041-clpc") ||
+	    clpc->hw->gpu_dense) {
+		clpc->gpu = kzalloc_obj(*clpc->gpu);
+		if (!clpc->gpu)
+			return -ENOMEM;
+		kref_init(&clpc->gpu->ref);
+		spin_lock_init(&clpc->gpu->lock);
+		ret = devm_add_action_or_reset(dev, apple_clpc_gpu_owner_put, clpc->gpu);
+		if (ret)
+			return ret;
+	}
 	if (clpc->hw->gpu_demand) {
 		struct device_node *gpu = of_parse_phandle(dev->of_node,
 							 "apple,gpu-power-state", 0);
@@ -420,8 +792,15 @@ static int apple_clpc_probe(struct platform_device *pdev)
 			    clpc->mask;
 	apple_clpc_find_clusters(clpc);
 	clpc->next_scan = jiffies + HZ;
+	mutex_init(&clpc->sample_lock);
 	INIT_DELAYED_WORK(&clpc->work, apple_clpc_work);
 	INIT_DEFERRABLE_WORK(&clpc->idle_work, apple_clpc_idle_work);
+	/* Sample at a cold publication only where that publication is the demand.
+	 * Dense counting needs no extra sample, and one taken as each frame of a
+	 * frame-paced client starts finds its CPUs busy and votes their fabric.
+	 */
+	if (clpc->gpu && !clpc->hw->gpu_demand)
+		clpc->gpu->wake = &clpc->work;
 
 	clpc->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("status", 0400, clpc->debugfs, clpc,
@@ -431,7 +810,9 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	mutex_lock(&apple_clpc_clients_lock);
 	platform_set_drvdata(pdev, clpc);
+	mutex_unlock(&apple_clpc_clients_lock);
 	apple_clpc_queue(clpc, true);
 	return 0;
 }
@@ -462,11 +843,6 @@ static int apple_clpc_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(apple_clpc_pm_ops, apple_clpc_suspend,
 				apple_clpc_resume);
 
-/*
- * T8140: DCS states 0-4 on rail 0, fabric states 0-3 on rail 1. A busy
- * cluster raises the DCS one state per frequency quartile and leaves the
- * fabric alone.
- */
 /* Only the stock M5/F3 busy floor is qualified on T8132. Do not invent
  * intermediate frequency-to-memory tables; idle can still release the vote.
  */
@@ -477,14 +853,47 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
 		[APPLE_CLPC_SOC] = { 3, 3, 3, 3 },
 	},
 	.gpu_demand = true,
+	.gpu = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 3 },
 };
 
+/*
+ * T8140: DCS states 0-4 on rail 0, fabric states 0-3 on rail 1. A busy
+ * cluster raises the DCS one state per frequency quartile and leaves the
+ * fabric alone.
+ *
+ * GPU work needs both rails at their top states: the GPU firmware takes up
+ * and completes every command over the fabric. With the fabric left at
+ * state 0, light GPU submissions take 30-50% longer than at state 3, and
+ * macOS holds the fabric at its top states while such work streams. The
+ * firmware powers graphics off a few milliseconds after the GPU idles, so
+ * graphics that stays powered for 64 ms marks such a stream. Loads
+ * paced by frames power it up and down with each frame instead: on J700,
+ * 1080p video playback and light browsing keep it powered for at most 63 ms
+ * at a time, and leave the floor down. The floor is released HOLD_MS after
+ * graphics powers off.
+ *
+ * The PMP (agent 0) votes the DCS to its top state for streams of light GPU
+ * submissions, and lowers it under sustained heavy rendering, which needs
+ * neither rail's floor; see apple_clpc_gpu_limited().
+ *
+ * Light submissions that come every few milliseconds let graphics power off
+ * between them, so they never stream, yet each still waits on the fabric,
+ * which with the panel off nothing else holds up. Two or more submissions in
+ * each of four sampling periods in a row (16 ms, one 60 Hz frame) get the
+ * floor too; a frame-paced load leaves a quieter period in every frame.
+ */
 static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
 	.map = {
 		[APPLE_CLPC_DCS] = { 1, 2, 3, 4 },
 		[APPLE_CLPC_SOC] = { 0, 0, 0, 0 },
 	},
+	.gpu_demand = true,
+	.gpu = { [APPLE_CLPC_DCS] = 4, [APPLE_CLPC_SOC] = 3 },
+	.gpu_sustain_ms = 64,
+	.pmp_backoff = true,
+	.pmp_agent = 0,
+	.gpu_dense = 2,
 };
 
 /*
@@ -499,6 +908,9 @@ static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
  * A cluster requests only after three busy samples in a row (12 ms). At idle
  * a single busy sample raised the floor about 60 % of the time, from short
  * bursts of background work; three in a row bring that to about 11 %.
+ * GPU demand bypasses the CPU streak and uses the same qualified DCS 5 /
+ * fabric 2 states until publication/in-flight demand ends and HOLD_MS expires.
+ * GFX supplier power cannot drive this input: firmware keeps it always on.
  */
 static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
@@ -507,7 +919,132 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 		[APPLE_CLPC_SOC] = { 0, 1, 2, 2 },
 	},
 	.sustain = 3,
+	.gpu_demand = false,
 };
+
+#if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
+#include <kunit/test.h>
+#include <linux/completion.h>
+
+static void apple_clpc_gpu_request_lifetime_test(struct kunit *test)
+{
+	struct apple_clpc_gpu *gpu = kzalloc_obj(*gpu);
+	u64 updated, sequence;
+
+	KUNIT_ASSERT_NOT_NULL(test, gpu);
+	kref_init(&gpu->ref);
+	spin_lock_init(&gpu->lock);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_active(gpu, &updated, &sequence));
+	KUNIT_EXPECT_EQ(test, sequence, 0ull);
+	/* Provider and one consumer own independent references. */
+	kref_get(&gpu->ref);
+	apple_clpc_gpu_set_active(gpu, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_gpu_active(gpu, &updated, &sequence));
+	KUNIT_EXPECT_GT(test, updated, 0ull);
+	KUNIT_EXPECT_EQ(test, sequence, 1ull);
+	apple_clpc_gpu_put(gpu);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_active(gpu, &updated, &sequence));
+	KUNIT_EXPECT_EQ(test, sequence, 2ull);
+	kref_put(&gpu->ref, apple_clpc_gpu_free);
+}
+
+static void apple_clpc_gpu_provider_removal_test(struct kunit *test)
+{
+	struct apple_clpc_gpu *gpu = kzalloc_obj(*gpu);
+	u64 updated, sequence;
+
+	KUNIT_ASSERT_NOT_NULL(test, gpu);
+	kref_init(&gpu->ref);
+	spin_lock_init(&gpu->lock);
+	kref_get(&gpu->ref);
+	/* Provider removal must not leave a late consumer with freed storage. */
+	kref_put(&gpu->ref, apple_clpc_gpu_free);
+	apple_clpc_gpu_set_active(gpu, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_gpu_active(gpu, &updated, &sequence));
+	apple_clpc_gpu_set_active(gpu, false);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_active(gpu, &updated, &sequence));
+	apple_clpc_gpu_put(gpu);
+}
+
+struct apple_clpc_wake_test {
+	struct delayed_work work;
+	struct completion done;
+};
+
+static void apple_clpc_wake_complete(struct work_struct *work)
+{
+	struct apple_clpc_wake_test *wake = container_of(to_delayed_work(work),
+													struct apple_clpc_wake_test, work);
+	complete(&wake->done);
+}
+
+static void apple_clpc_gpu_cold_wake_test(struct kunit *test)
+{
+	struct apple_clpc_gpu *gpu = kzalloc_obj(*gpu);
+	struct apple_clpc_wake_test wake;
+
+	KUNIT_ASSERT_NOT_NULL(test, gpu);
+	kref_init(&gpu->ref);
+	spin_lock_init(&gpu->lock);
+	INIT_DELAYED_WORK(&wake.work, apple_clpc_wake_complete);
+	init_completion(&wake.done);
+	gpu->wake = &wake.work;
+	apple_clpc_gpu_set_active(gpu, true);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&wake.done, HZ), 0ul);
+	/* Model provider withdrawal before its work storage is destroyed. */
+	gpu->wake = NULL;
+	cancel_delayed_work_sync(&wake.work);
+	apple_clpc_gpu_put(gpu);
+}
+
+static void apple_clpc_gpu_dense_test(struct kunit *test)
+{
+	unsigned int streak = 0, i;
+	u64 last = 0, sequence = 0;
+
+	/* Two submissions in each of four periods in a row: dense. */
+	for (i = 0; i < APPLE_CLPC_GPU_DENSE_SAMPLES - 1; i++) {
+		sequence += 2;
+		KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_dense_step(&streak, &last,
+							       sequence, 2, false));
+	}
+	sequence += 2;
+	KUNIT_EXPECT_TRUE(test, apple_clpc_gpu_dense_step(&streak, &last,
+						      sequence, 2, false));
+	/* A quieter period, as every frame of a 60 Hz load has, ends it. */
+	sequence += 1;
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_dense_step(&streak, &last,
+						       sequence, 2, false));
+	KUNIT_EXPECT_EQ(test, streak, 0u);
+	/* A late sample counts more than one period: it ends a streak too. */
+	for (i = 0; i < APPLE_CLPC_GPU_DENSE_SAMPLES; i++) {
+		sequence += 4;
+		apple_clpc_gpu_dense_step(&streak, &last, sequence, 2, false);
+	}
+	KUNIT_EXPECT_EQ(test, streak, APPLE_CLPC_GPU_DENSE_SAMPLES);
+	sequence += 40;
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_dense_step(&streak, &last,
+						       sequence, 2, true));
+	/* No threshold: never dense. */
+	streak = APPLE_CLPC_GPU_DENSE_SAMPLES;
+	sequence += 10;
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_dense_step(&streak, &last,
+						       sequence, 0, false));
+}
+
+static struct kunit_case apple_clpc_cases[] = {
+	KUNIT_CASE(apple_clpc_gpu_dense_test),
+	KUNIT_CASE(apple_clpc_gpu_cold_wake_test),
+	KUNIT_CASE(apple_clpc_gpu_request_lifetime_test),
+	KUNIT_CASE(apple_clpc_gpu_provider_removal_test),
+	{}
+};
+static struct kunit_suite apple_clpc_suite = {
+	.name = "apple-clpc-gpu",
+	.test_cases = apple_clpc_cases,
+};
+kunit_test_suite(apple_clpc_suite);
+#endif
 
 static const struct of_device_id apple_clpc_of_match[] = {
 	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
