@@ -176,25 +176,44 @@ static int __regmap_sn201202x_write(void *context, const void *data,
 
 /*
  * A register access wakes a controller that sleeps idle, and lets it sleep
- * again SN201202X_AUTOSUSPEND_MS after the last one. In system sleep the
- * event path wakes it and puts it back to sleep itself.
+ * again SN201202X_AUTOSUSPEND_MS after the last one, with its tries to sleep
+ * counted afresh. In system sleep the event path wakes it and puts it back
+ * to sleep itself.
  */
+static int sn201202x_access_get(struct tps6598x *tps, bool *rpm)
+{
+	int err;
+
+	*rpm = !READ_ONCE(tps_to_sn(tps)->atomic);
+	if (!*rpm)
+		return 0;
+	err = pm_runtime_resume_and_get(tps->dev);
+	if (err)
+		return err;
+	/* Held awake, so no runtime suspend runs meanwhile */
+	tps_to_sn(tps)->sleep_tries = 0;
+	return 0;
+}
+
+static void sn201202x_access_put(struct tps6598x *tps, bool rpm)
+{
+	if (rpm)
+		pm_runtime_put_autosuspend(tps->dev);
+}
+
 static int regmap_sn201202x_read(void *context,
 				 const void *reg, size_t reg_size,
 				 void *val, size_t val_size)
 {
 	struct tps6598x *tps = spmi_device_get_drvdata(context);
-	bool rpm = !READ_ONCE(tps_to_sn(tps)->atomic);
+	bool rpm;
 	int err;
 
-	if (rpm) {
-		err = pm_runtime_resume_and_get(tps->dev);
-		if (err)
-			return err;
-	}
+	err = sn201202x_access_get(tps, &rpm);
+	if (err)
+		return err;
 	err = __regmap_sn201202x_read(context, reg, reg_size, val, val_size);
-	if (rpm)
-		pm_runtime_put_autosuspend(tps->dev);
+	sn201202x_access_put(tps, rpm);
 	return err;
 }
 
@@ -202,17 +221,14 @@ static int regmap_sn201202x_write(void *context, const void *data,
 				  size_t count)
 {
 	struct tps6598x *tps = spmi_device_get_drvdata(context);
-	bool rpm = !READ_ONCE(tps_to_sn(tps)->atomic);
+	bool rpm;
 	int err;
 
-	if (rpm) {
-		err = pm_runtime_resume_and_get(tps->dev);
-		if (err)
-			return err;
-	}
+	err = sn201202x_access_get(tps, &rpm);
+	if (err)
+		return err;
 	err = __regmap_sn201202x_write(context, data, count);
-	if (rpm)
-		pm_runtime_put_autosuspend(tps->dev);
+	sn201202x_access_put(tps, rpm);
 	return err;
 }
 
@@ -224,12 +240,13 @@ static irqreturn_t sn201202x_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static const struct regmap_bus regmap_sn201202x = {
+VISIBLE_IF_KUNIT const struct regmap_bus regmap_sn201202x = {
 	.read				= regmap_sn201202x_read,
 	.write				= regmap_sn201202x_write,
 	.reg_format_endian_default	= REGMAP_ENDIAN_NATIVE,
 	.val_format_endian_default	= REGMAP_ENDIAN_NATIVE,
 };
+EXPORT_SYMBOL_IF_KUNIT(regmap_sn201202x);
 
 static struct regmap *__devm_regmap_init_sn201202x(struct spmi_device *sdev,
 						   const struct regmap_config *config,
@@ -345,7 +362,10 @@ asleep:
 	return 0;
 
 retry:
-	/* With a new expiry, runtime PM tries again after the delay */
+	/*
+	 * With a new expiry, runtime PM tries again after the delay. Without
+	 * a delay it does not, and the controller waits for the next access.
+	 */
 	if (++sn->sleep_tries < SN201202X_SLEEP_TRIES) {
 		pm_runtime_mark_last_busy(dev);
 		return -EAGAIN;
@@ -363,6 +383,32 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_runtime_resume(struct device *dev)
 	return sn201202x_wake(tps_to_sn(tps));
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_runtime_resume);
+
+/*
+ * The SPMI bus holds a runtime PM reference while the driver is bound.
+ * Probe gives it to idle sleep only where the event interrupt stays live
+ * while the controller sleeps, as the system sleep event filter has it;
+ * elsewhere the controller stays awake.
+ */
+VISIBLE_IF_KUNIT void sn201202x_idle_sleep_start(struct tps6598x *tps)
+{
+	if (!tps->sleep_event)
+		return;
+	pm_runtime_set_autosuspend_delay(tps->dev, SN201202X_AUTOSUSPEND_MS);
+	pm_runtime_use_autosuspend(tps->dev);
+	pm_runtime_put_autosuspend(tps->dev);
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_idle_sleep_start);
+
+/* On remove, once the bus has woken it: take back the reference */
+VISIBLE_IF_KUNIT void sn201202x_idle_sleep_stop(struct tps6598x *tps)
+{
+	if (!tps->sleep_event)
+		return;
+	pm_runtime_get_noresume(tps->dev);
+	pm_runtime_dont_use_autosuspend(tps->dev);
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_idle_sleep_stop);
 
 /*
  * The links that wake the system when they appear in system sleep. A port
@@ -527,17 +573,7 @@ static int sn201202x_probe(struct spmi_device *device)
 		return ret;
 	}
 
-	/*
-	 * The SPMI bus holds a runtime PM reference while the driver is bound.
-	 * Give it to idle sleep only where the event interrupt stays live while
-	 * the controller sleeps, as the system sleep event filter has it;
-	 * elsewhere the controller stays awake.
-	 */
-	if (tps->sleep_event) {
-		pm_runtime_set_autosuspend_delay(&device->dev, SN201202X_AUTOSUSPEND_MS);
-		pm_runtime_use_autosuspend(&device->dev);
-		pm_runtime_put_autosuspend(&device->dev);
-	}
+	sn201202x_idle_sleep_start(tps);
 	return 0;
 }
 
@@ -546,11 +582,7 @@ static void sn201202x_remove(struct spmi_device *device)
 	struct tps6598x *tps = spmi_device_get_drvdata(device);
 	struct sn201202x *sn = tps_to_sn(tps);
 
-	/* The bus has woken it; take back the reference that probe gave away */
-	if (tps->sleep_event) {
-		pm_runtime_get_noresume(&device->dev);
-		pm_runtime_dont_use_autosuspend(&device->dev);
-	}
+	sn201202x_idle_sleep_stop(tps);
 	tipd_remove(tps);
 	spmi_command_sleep(sn->sdev);
 }

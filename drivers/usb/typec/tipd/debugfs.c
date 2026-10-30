@@ -34,15 +34,6 @@
 
 #define TPS_REG_MAX	0x7f
 
-struct tipd_debugfs {
-	struct dentry *dentry;
-	/*
-	 * Open "command" files that entered "DBMa"; written under tps->lock,
-	 * read without it by tipd_debugfs_dbma_held()
-	 */
-	unsigned int dbma_holders;
-};
-
 /*
  * Whether an open "command" file holds the controller in "DBMa". Read
  * without tps->lock, by runtime suspend: remove unregisters only once the
