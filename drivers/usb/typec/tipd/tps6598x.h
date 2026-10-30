@@ -465,6 +465,8 @@ struct sn201202x {
 	bool sleep_watch;
 	/* Busy-wait: in suspend-to-idle a sleeping wait outlasts the timers */
 	bool atomic;
+	/* Failed tries to sleep while idle since it last slept or gave up */
+	unsigned int sleep_tries;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -494,10 +496,12 @@ int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 			  u32 cmd_timeout_ms, u32 res_delay_ms);
 
 #ifdef CONFIG_DEBUG_FS
+bool tipd_debugfs_dbma_held(struct tps6598x *tps);
 void tipd_debugfs_register(struct tps6598x *tps);
 void tipd_debugfs_unregister(struct tps6598x *tps);
 void tipd_debugfs_exit(void);
 #else
+static inline bool tipd_debugfs_dbma_held(struct tps6598x *tps) { return false; }
 static inline void tipd_debugfs_register(struct tps6598x *tps) { }
 static inline void tipd_debugfs_unregister(struct tps6598x *tps) { }
 static inline void tipd_debugfs_exit(void) { }
@@ -510,6 +514,8 @@ struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode);
 int sn201202x_suspend(struct device *dev);
 int sn201202x_resume(struct device *dev);
+int sn201202x_runtime_suspend(struct device *dev);
+int sn201202x_runtime_resume(struct device *dev);
 u32 sn201202x_sleep_links(const struct cd321x_sleep_state *st);
 #endif
 

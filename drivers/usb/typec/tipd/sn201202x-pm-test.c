@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * KUnit tests for SN201202x system sleep
+ * KUnit tests for SN201202x system sleep and idle sleep
  */
 
 #include <kunit/device.h>
 #include <kunit/test.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/module.h>
+#include <linux/pm_runtime.h>
+#include <linux/pm_wakeup.h>
 #include <linux/regmap.h>
 #include <linux/spmi.h>
+#include <linux/suspend.h>
 
 #include "tps6598x.h"
 
 /*
  * A controller on a simulated SPMI bus. It confirms SLEEP and WAKEUP with the
- * interrupts the driver waits for, unless the SLEEP confirmation gets lost,
- * and it does not answer register accesses while it is asleep.
+ * interrupts the driver waits for, unless the SLEEP confirmation gets lost
+ * (every time, or once), and it does not answer register accesses while it
+ * is asleep.
  */
 struct sn201202x_test {
 	struct sn201202x sn;
@@ -24,6 +29,8 @@ struct sn201202x_test {
 	int irq;
 	bool asleep;
 	bool sleep_unconfirmed;
+	bool sleep_unconfirmed_once;
+	unsigned int sleeps;
 	int sleep_error;
 	int wakeup_error;
 	unsigned int wakeups;
@@ -41,10 +48,13 @@ static int sn201202x_test_cmd(struct spmi_controller *ctrl, u8 opcode, u8 sid)
 
 	switch (opcode) {
 	case SPMI_CMD_SLEEP:
+		t->sleeps++;
 		if (t->sleep_error)
 			return t->sleep_error;
 		t->asleep = true;
-		if (!t->sleep_unconfirmed)
+		if (t->sleep_unconfirmed_once)
+			t->sleep_unconfirmed_once = false;
+		else if (!t->sleep_unconfirmed)
 			complete(&t->sn.sleep_completion);
 		return 0;
 	case SPMI_CMD_WAKEUP:
@@ -94,6 +104,21 @@ static irqreturn_t sn201202x_test_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* The driver's runtime PM callbacks, for the test device */
+static const struct dev_pm_ops sn201202x_test_pm_ops = {
+	SET_RUNTIME_PM_OPS(sn201202x_runtime_suspend, sn201202x_runtime_resume, NULL)
+};
+
+static const struct device_type sn201202x_test_type = {
+	.name = "sn201202x-test",
+	.pm = &sn201202x_test_pm_ops,
+};
+
+static void sn201202x_test_rpm_disable(void *data)
+{
+	pm_runtime_disable(data);
+}
+
 static void sn201202x_test_put_device(void *data)
 {
 	spmi_device_put(data);
@@ -141,6 +166,7 @@ static struct sn201202x_test *sn201202x_test_port(struct kunit *test)
 				       &tps6598x_regmap_config);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, tps->regmap);
 	dev_set_drvdata(t->dev, tps);
+	mutex_init(&tps->lock);
 
 	/* The event interrupt, which is never raised. */
 	t->irq = irq_alloc_desc(NUMA_NO_NODE);
@@ -153,6 +179,19 @@ static struct sn201202x_test *sn201202x_test_port(struct kunit *test)
 					  "sn201202x-test", t), 0);
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, sn201202x_test_free_irq, t), 0);
 	tps->irq = t->irq;
+
+	/*
+	 * Awake as probe leaves it; no case waits out the autosuspend delay.
+	 * Set up last, so it is torn down first: no runtime PM callback can
+	 * reach the interrupt or the SPMI device once they are gone.
+	 */
+	t->dev->type = &sn201202x_test_type;
+	pm_runtime_set_active(t->dev);
+	pm_runtime_set_autosuspend_delay(t->dev, 60 * MSEC_PER_SEC);
+	pm_runtime_use_autosuspend(t->dev);
+	pm_runtime_enable(t->dev);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, sn201202x_test_rpm_disable,
+							t->dev), 0);
 
 	return t;
 }
@@ -170,6 +209,7 @@ static void sn201202x_sleep_cycle_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->wakeups, 1U);
 	KUNIT_EXPECT_FALSE(test, t->irq_enabled_at_wakeup);
 	KUNIT_EXPECT_TRUE(test, sn201202x_test_irq_enabled(t));
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->dev->power.usage_count), 0);
 }
 
 static void sn201202x_failed_wakeup_test(struct kunit *test)
@@ -181,6 +221,7 @@ static void sn201202x_failed_wakeup_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sn201202x_resume(t->dev), -EIO);
 	/* Events are handled again once the controller answers. */
 	KUNIT_EXPECT_TRUE(test, sn201202x_test_irq_enabled(t));
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->dev->power.usage_count), 0);
 }
 
 static void sn201202x_rejected_sleep_test(struct kunit *test)
@@ -192,6 +233,7 @@ static void sn201202x_rejected_sleep_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, t->asleep);
 	KUNIT_EXPECT_EQ(test, t->wakeups, 0U);
 	KUNIT_EXPECT_TRUE(test, sn201202x_test_irq_enabled(t));
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->dev->power.usage_count), 0);
 }
 
 static void sn201202x_unconfirmed_sleep_test(struct kunit *test)
@@ -206,6 +248,7 @@ static void sn201202x_unconfirmed_sleep_test(struct kunit *test)
 	/* ...before its events are handled again. */
 	KUNIT_EXPECT_FALSE(test, t->irq_enabled_at_wakeup);
 	KUNIT_EXPECT_TRUE(test, sn201202x_test_irq_enabled(t));
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->dev->power.usage_count), 0);
 }
 
 static void sn201202x_unconfirmed_sleep_failed_wakeup_test(struct kunit *test)
@@ -218,6 +261,198 @@ static void sn201202x_unconfirmed_sleep_failed_wakeup_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sn201202x_suspend(t->dev), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, t->wakeups, 1U);
 	KUNIT_EXPECT_TRUE(test, sn201202x_test_irq_enabled(t));
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->dev->power.usage_count), 0);
+}
+
+/* An idle controller sleeps, and the next register access wakes it. */
+static void sn201202x_idle_sleep_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+
+	KUNIT_ASSERT_EQ(test, pm_runtime_suspend(t->dev), 0);
+	KUNIT_EXPECT_TRUE(test, t->asleep);
+
+	/* As a register access does */
+	KUNIT_ASSERT_EQ(test, pm_runtime_resume_and_get(t->dev), 0);
+	KUNIT_EXPECT_EQ(test, t->wakeups, 1U);
+	KUNIT_EXPECT_FALSE(test, t->asleep);
+	KUNIT_EXPECT_TRUE(test, pm_runtime_active(t->dev));
+	pm_runtime_put_autosuspend(t->dev);
+}
+
+/* A lost SLEEP confirmation leaves it awake, and runtime PM tries again. */
+static void sn201202x_idle_sleep_retry_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+	int i;
+
+	/* Busy from now, a short delay schedules the first attempt, which loses its SLEEP. */
+	t->sleep_unconfirmed_once = true;
+	pm_runtime_mark_last_busy(t->dev);
+	pm_runtime_set_autosuspend_delay(t->dev, 10);
+	for (i = 0; i < 100 && !pm_runtime_suspended(t->dev); i++)
+		msleep(20);
+	KUNIT_EXPECT_TRUE(test, pm_runtime_suspended(t->dev));
+	KUNIT_EXPECT_EQ(test, t->sleeps, 2U);
+	KUNIT_EXPECT_EQ(test, t->wakeups, 1U);
+	KUNIT_EXPECT_TRUE(test, t->asleep);
+}
+
+/* Without SLEEP confirmations it gives up after a few tries, until the next access. */
+static void sn201202x_idle_sleep_gives_up_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+
+	int i;
+
+	t->sleep_unconfirmed = true;
+	pm_runtime_mark_last_busy(t->dev);
+	pm_runtime_set_autosuspend_delay(t->dev, 10);
+	for (i = 0; i < 100 && t->sleeps < 3; i++)
+		msleep(20);
+	/* Long enough for a fourth try, which must not come */
+	msleep(200);
+	KUNIT_EXPECT_EQ(test, t->sleeps, 3U);
+	KUNIT_EXPECT_TRUE(test, pm_runtime_active(t->dev));
+	KUNIT_EXPECT_FALSE(test, t->asleep);
+
+	/* The next access lets it try again */
+	KUNIT_ASSERT_EQ(test, pm_runtime_resume_and_get(t->dev), 0);
+	pm_runtime_put_autosuspend(t->dev);
+	for (i = 0; i < 100 && t->sleeps < 6; i++)
+		msleep(20);
+	msleep(200);
+	KUNIT_EXPECT_EQ(test, t->sleeps, 6U);
+}
+
+/* Not woken after an unconfirmed SLEEP, it is taken as asleep; the port works on. */
+static void sn201202x_unconfirmed_idle_sleep_failed_wakeup_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+
+	t->sleep_unconfirmed = true;
+	t->wakeup_error = -EIO;
+	KUNIT_EXPECT_EQ(test, pm_runtime_suspend(t->dev), 0);
+	KUNIT_EXPECT_TRUE(test, pm_runtime_suspended(t->dev));
+
+	t->wakeup_error = 0;
+	KUNIT_ASSERT_EQ(test, pm_runtime_resume_and_get(t->dev), 0);
+	KUNIT_EXPECT_FALSE(test, t->asleep);
+	pm_runtime_put_autosuspend(t->dev);
+}
+
+/* A display link keeps it awake. */
+static void sn201202x_display_link_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+
+	t->sn.cd.tps.status = TPS_STATUS_PLUG_PRESENT;
+	t->sn.cd.tps.data_status = TPS_DATA_STATUS_DATA_CONNECTION |
+				   TPS_DATA_STATUS_DP_CONNECTION;
+	KUNIT_EXPECT_EQ(test, pm_runtime_suspend(t->dev), -EBUSY);
+	KUNIT_EXPECT_EQ(test, t->sleeps, 0U);
+	KUNIT_EXPECT_FALSE(test, t->asleep);
+}
+
+/* So does Apple's DBMa debug mode. */
+static void sn201202x_dbma_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+
+	t->sn.cd.tps.dbma_at_probe = 1;
+	KUNIT_EXPECT_EQ(test, pm_runtime_suspend(t->dev), -EBUSY);
+	KUNIT_EXPECT_EQ(test, t->sleeps, 0U);
+	KUNIT_EXPECT_FALSE(test, t->asleep);
+}
+
+/* Unplugged in system sleep, the cached data status stays, but not the plug. */
+static void sn201202x_display_unplugged_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+
+	t->sn.cd.tps.data_status = TPS_DATA_STATUS_DATA_CONNECTION |
+				   TPS_DATA_STATUS_DP_CONNECTION;
+	KUNIT_EXPECT_EQ(test, pm_runtime_suspend(t->dev), 0);
+	KUNIT_EXPECT_TRUE(test, t->asleep);
+}
+
+/* System sleep wakes an idle controller before its own SLEEP handshake. */
+static void sn201202x_sleep_from_idle_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+
+	KUNIT_ASSERT_EQ(test, pm_runtime_suspend(t->dev), 0);
+	KUNIT_ASSERT_EQ(test, sn201202x_suspend(t->dev), 0);
+	KUNIT_EXPECT_EQ(test, t->wakeups, 1U);
+	KUNIT_EXPECT_TRUE(test, t->asleep);
+	KUNIT_EXPECT_TRUE(test, pm_runtime_active(t->dev));
+
+	KUNIT_EXPECT_EQ(test, sn201202x_resume(t->dev), 0);
+	KUNIT_EXPECT_EQ(test, t->wakeups, 2U);
+	KUNIT_EXPECT_FALSE(test, t->asleep);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->dev->power.usage_count), 0);
+}
+
+/* An idle controller that does not wake sleeps on through system sleep. */
+static void sn201202x_sleep_from_idle_failed_wakeup_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+
+	KUNIT_ASSERT_EQ(test, pm_runtime_suspend(t->dev), 0);
+	t->wakeup_error = -EIO;
+	KUNIT_EXPECT_EQ(test, sn201202x_suspend(t->dev), 0);
+	KUNIT_EXPECT_TRUE(test, t->asleep);
+	KUNIT_EXPECT_FALSE(test, t->sn.sleep_watch);
+	KUNIT_EXPECT_FALSE(test, sn201202x_test_irq_enabled(t));
+
+	t->wakeup_error = 0;
+	KUNIT_EXPECT_EQ(test, sn201202x_resume(t->dev), 0);
+	KUNIT_EXPECT_FALSE(test, t->asleep);
+	/* Woken through runtime PM, so the next access sends no second WAKEUP */
+	KUNIT_EXPECT_TRUE(test, pm_runtime_active(t->dev));
+	KUNIT_EXPECT_TRUE(test, sn201202x_test_irq_enabled(t));
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->dev->power.usage_count), 0);
+}
+
+static bool sn201202x_test_sleep_event(struct tps6598x *tps)
+{
+	return true;
+}
+
+static void sn201202x_test_restore_target(void *data)
+{
+	pm_suspend_target_state = (suspend_state_t)(unsigned long)data;
+}
+
+static void sn201202x_test_wakeup_off(void *data)
+{
+	device_init_wakeup(data, false);
+}
+
+/* So does suspend-to-idle with the wakeup watch, whose baseline read needs it awake. */
+static void sn201202x_watched_sleep_from_idle_test(struct kunit *test)
+{
+	struct sn201202x_test *t = sn201202x_test_port(test);
+	suspend_state_t target;
+
+	t->sn.cd.tps.sleep_event = sn201202x_test_sleep_event;
+	KUNIT_ASSERT_EQ(test, device_init_wakeup(t->dev, true), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, sn201202x_test_wakeup_off,
+							t->dev), 0);
+	target = pm_suspend_target_state;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, sn201202x_test_restore_target,
+							(void *)(unsigned long)target), 0);
+	pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+
+	KUNIT_ASSERT_EQ(test, pm_runtime_suspend(t->dev), 0);
+	KUNIT_ASSERT_EQ(test, sn201202x_suspend(t->dev), 0);
+	KUNIT_EXPECT_TRUE(test, t->sn.sleep_watch);
+	KUNIT_EXPECT_TRUE(test, t->asleep);
+
+	KUNIT_EXPECT_EQ(test, sn201202x_resume(t->dev), 0);
+	KUNIT_EXPECT_FALSE(test, t->sn.sleep_watch);
+	KUNIT_EXPECT_FALSE(test, t->asleep);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->dev->power.usage_count), 0);
 }
 
 /* As read on a J713, the dock aside */
@@ -269,6 +504,16 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_unconfirmed_sleep_test),
 	KUNIT_CASE(sn201202x_unconfirmed_sleep_failed_wakeup_test),
 	KUNIT_CASE(sn201202x_sleep_links_test),
+	KUNIT_CASE(sn201202x_idle_sleep_test),
+	KUNIT_CASE(sn201202x_idle_sleep_retry_test),
+	KUNIT_CASE(sn201202x_idle_sleep_gives_up_test),
+	KUNIT_CASE(sn201202x_unconfirmed_idle_sleep_failed_wakeup_test),
+	KUNIT_CASE(sn201202x_display_link_test),
+	KUNIT_CASE(sn201202x_display_unplugged_test),
+	KUNIT_CASE(sn201202x_dbma_test),
+	KUNIT_CASE(sn201202x_sleep_from_idle_test),
+	KUNIT_CASE(sn201202x_sleep_from_idle_failed_wakeup_test),
+	KUNIT_CASE(sn201202x_watched_sleep_from_idle_test),
 	{}
 };
 
@@ -278,6 +523,6 @@ static struct kunit_suite sn201202x_pm_suite = {
 };
 
 kunit_test_suite(sn201202x_pm_suite);
-MODULE_DESCRIPTION("KUnit tests for SN201202x system sleep");
+MODULE_DESCRIPTION("KUnit tests for SN201202x system sleep and idle sleep");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");

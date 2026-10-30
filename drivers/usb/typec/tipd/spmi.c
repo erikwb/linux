@@ -6,6 +6,7 @@
 #include <linux/iopoll.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
+#include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/spmi.h>
@@ -18,6 +19,11 @@
 
 /* A sleeping controller does not answer a select; give up on it sooner. */
 #define SN201202X_ATOMIC_SELECT_MS	10
+
+/* An idle controller sleeps after this long without register access. */
+#define SN201202X_AUTOSUSPEND_MS	1000
+/* Failed tries to sleep before it waits for the next access */
+#define SN201202X_SLEEP_TRIES		3
 
 static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 {
@@ -76,9 +82,9 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 	return -EIO;
 }
 
-static int regmap_sn201202x_read(void *context,
-				 const void *reg, size_t reg_size,
-				 void *val, size_t val_size)
+static int __regmap_sn201202x_read(void *context,
+				   const void *reg, size_t reg_size,
+				   void *val, size_t val_size)
 {
 	struct spmi_device *sdev = context;
 	int err;
@@ -129,8 +135,8 @@ static int regmap_sn201202x_read(void *context,
 	return 0;
 }
 
-static int regmap_sn201202x_write(void *context, const void *data,
-				  size_t count)
+static int __regmap_sn201202x_write(void *context, const void *data,
+				    size_t count)
 {
 	int err = 0;
 	unsigned int offset = 0xa0;
@@ -165,6 +171,48 @@ static int regmap_sn201202x_write(void *context, const void *data,
 		count -= len;
 	}
 
+	return err;
+}
+
+/*
+ * A register access wakes a controller that sleeps idle, and lets it sleep
+ * again SN201202X_AUTOSUSPEND_MS after the last one. In system sleep the
+ * event path wakes it and puts it back to sleep itself.
+ */
+static int regmap_sn201202x_read(void *context,
+				 const void *reg, size_t reg_size,
+				 void *val, size_t val_size)
+{
+	struct tps6598x *tps = spmi_device_get_drvdata(context);
+	bool rpm = !READ_ONCE(tps_to_sn(tps)->atomic);
+	int err;
+
+	if (rpm) {
+		err = pm_runtime_resume_and_get(tps->dev);
+		if (err)
+			return err;
+	}
+	err = __regmap_sn201202x_read(context, reg, reg_size, val, val_size);
+	if (rpm)
+		pm_runtime_put_autosuspend(tps->dev);
+	return err;
+}
+
+static int regmap_sn201202x_write(void *context, const void *data,
+				  size_t count)
+{
+	struct tps6598x *tps = spmi_device_get_drvdata(context);
+	bool rpm = !READ_ONCE(tps_to_sn(tps)->atomic);
+	int err;
+
+	if (rpm) {
+		err = pm_runtime_resume_and_get(tps->dev);
+		if (err)
+			return err;
+	}
+	err = __regmap_sn201202x_write(context, data, count);
+	if (rpm)
+		pm_runtime_put_autosuspend(tps->dev);
 	return err;
 }
 
@@ -258,6 +306,64 @@ static int sn201202x_wake(struct sn201202x *sn)
 	return sn201202x_wake_poll(sn, sn->polled);
 }
 
+VISIBLE_IF_KUNIT int __maybe_unused sn201202x_runtime_suspend(struct device *dev)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	/*
+	 * A display, Thunderbolt or USB4 link keeps it awake: its events are
+	 * untested with the controller asleep. The next event, such as the
+	 * unplug, lets it sleep again. The data status is not read again
+	 * without a plug, so the plug status says when the link is gone.
+	 */
+	if ((READ_ONCE(tps->status) & TPS_STATUS_PLUG_PRESENT) &&
+	    (READ_ONCE(tps->data_status) & (TPS_DATA_STATUS_DP_CONNECTION |
+					    TPS_DATA_STATUS_TBT_CONNECTION |
+					    CD321X_DATA_STATUS_USB4_CONNECTION)))
+		return -EBUSY;
+	/* So does Apple's "DBMa" debug mode, for the routes it carries */
+	if (tps->dbma_at_probe || tipd_debugfs_dbma_held(tps))
+		return -EBUSY;
+
+	reinit_completion(&sn->sleep_completion);
+	if (spmi_command_sleep(sn->sdev))
+		goto retry;
+	if (!sn->polled &&
+	    !wait_for_completion_timeout(&sn->sleep_completion, msecs_to_jiffies(100))) {
+		/*
+		 * It accepted SLEEP, so it may be asleep without having
+		 * confirmed it. Woken, it tries again later; if it does not
+		 * wake, it is taken as asleep, and the next access wakes it.
+		 */
+		if (sn201202x_wake(sn))
+			goto asleep;
+		goto retry;
+	}
+asleep:
+	sn->sleep_tries = 0;
+	return 0;
+
+retry:
+	/* With a new expiry, runtime PM tries again after the delay */
+	if (++sn->sleep_tries < SN201202X_SLEEP_TRIES) {
+		pm_runtime_mark_last_busy(dev);
+		return -EAGAIN;
+	}
+	sn->sleep_tries = 0;
+	dev_warn_once(dev, "cannot sleep while idle, awake until the next access\n");
+	return -EBUSY;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_runtime_suspend);
+
+VISIBLE_IF_KUNIT int __maybe_unused sn201202x_runtime_resume(struct device *dev)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+
+	return sn201202x_wake(tps_to_sn(tps));
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_runtime_resume);
+
 /*
  * The links that wake the system when they appear in system sleep. A port
  * attaches as a USB device before any data role swap, as it does to a
@@ -298,7 +404,7 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 	if (!READ_ONCE(sn->sleep_watch))
 		return false;
 
-	sn->atomic = true;
+	WRITE_ONCE(sn->atomic, true);
 	ret = sn201202x_wake_poll(sn, true);
 	if (!ret)
 		ret = cd321x_sleep_events(tps, &st);
@@ -308,7 +414,7 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 	if (!ret)
 		sn->sleep_links = links;
 	spmi_command_sleep(sn->sdev);
-	sn->atomic = false;
+	WRITE_ONCE(sn->atomic, false);
 	if (wake)
 		pm_wakeup_dev_event(tps->dev, 0, true);
 	return true;
@@ -416,9 +522,23 @@ static int sn201202x_probe(struct spmi_device *device)
 		return ret;
 
 	ret = tipd_init(tps);
-	if (ret)
+	if (ret) {
 		spmi_command_sleep(device);
-	return ret;
+		return ret;
+	}
+
+	/*
+	 * The SPMI bus holds a runtime PM reference while the driver is bound.
+	 * Give it to idle sleep only where the event interrupt stays live while
+	 * the controller sleeps, as the system sleep event filter has it;
+	 * elsewhere the controller stays awake.
+	 */
+	if (tps->sleep_event) {
+		pm_runtime_set_autosuspend_delay(&device->dev, SN201202X_AUTOSUSPEND_MS);
+		pm_runtime_use_autosuspend(&device->dev);
+		pm_runtime_put_autosuspend(&device->dev);
+	}
+	return 0;
 }
 
 static void sn201202x_remove(struct spmi_device *device)
@@ -426,6 +546,11 @@ static void sn201202x_remove(struct spmi_device *device)
 	struct tps6598x *tps = spmi_device_get_drvdata(device);
 	struct sn201202x *sn = tps_to_sn(tps);
 
+	/* The bus has woken it; take back the reference that probe gave away */
+	if (tps->sleep_event) {
+		pm_runtime_get_noresume(&device->dev);
+		pm_runtime_dont_use_autosuspend(&device->dev);
+	}
 	tipd_remove(tps);
 	spmi_command_sleep(sn->sdev);
 }
@@ -441,12 +566,20 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 		disable_irq(tps->irq);
 		WRITE_ONCE(sn->sleep_watch, false);
 	}
-	err = sn201202x_wake(sn);
+	/* One that slept on from idle sleep wakes through runtime PM */
+	if (pm_runtime_status_suspended(dev)) {
+		err = pm_runtime_resume(dev);
+		if (err > 0)
+			err = 0;
+	} else {
+		err = sn201202x_wake(sn);
+	}
 	if (!err)
 		err = tipd_resume(tps);
 	/* The resume revalidation acknowledges events latched while asleep. */
 	if (tps->irq)
 		enable_irq(tps->irq);
+	pm_runtime_put_autosuspend(dev);
 	return err;
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_resume);
@@ -465,9 +598,20 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	 */
 	if (tps->irq)
 		disable_irq(tps->irq);
+	/* Awake, also from idle sleep, until resume */
+	err = pm_runtime_resume_and_get(dev);
+	if (err) {
+		/*
+		 * It sleeps idle and does not wake: let it sleep on without
+		 * the wakeup watch, and let resume wake it.
+		 */
+		dev_warn(dev, "asleep and not waking: %d, no wakeup for an attach\n", err);
+		pm_runtime_get_noresume(dev);
+		return 0;
+	}
 	err = tipd_suspend(tps);
 	if (err)
-		goto out_enable;
+		goto out_put;
 	watch = tps->sleep_event && device_may_wakeup(dev) &&
 		pm_suspend_target_state == PM_SUSPEND_TO_IDLE;
 	if (watch) {
@@ -503,7 +647,8 @@ out_wake:
 		dev_err(dev, "failed to wake up after failed suspend: %d\n", ret);
 out_resume:
 	tipd_resume(tps);
-out_enable:
+out_put:
+	pm_runtime_put_autosuspend(dev);
 	if (tps->irq)
 		enable_irq(tps->irq);
 	return err;
@@ -516,6 +661,7 @@ static const struct dev_pm_ops sn201202x_pm_ops = {
 	.prepare = pm_sleep_ptr(tipd_prepare),
 	.complete = pm_sleep_ptr(tipd_complete),
 	SET_SYSTEM_SLEEP_PM_OPS(sn201202x_suspend, sn201202x_resume)
+	SET_RUNTIME_PM_OPS(sn201202x_runtime_suspend, sn201202x_runtime_resume, NULL)
 };
 
 static struct spmi_driver sn201202x_driver = {
