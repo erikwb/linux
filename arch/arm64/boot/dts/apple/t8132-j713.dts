@@ -233,6 +233,7 @@
 		reg = <0x38>;
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Left Woofer";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
@@ -245,6 +246,7 @@
 		reg = <0x39>;
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Left Tweeter";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
@@ -257,6 +259,7 @@
 		reg = <0x3b>;
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Right Woofer";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
@@ -269,6 +272,7 @@
 		reg = <0x3c>;
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Right Tweeter";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
